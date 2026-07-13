@@ -91,12 +91,6 @@ ENTRY(metal_abundances, INT, 0)
 */
 ENTRY(dust_species, INT, 0)
 
-/* Flag to solve temperatures of multiple grain species */
-ENTRY(use_multiple_dust_temperatures, INT, FALSE)
-
-/* Flag to supply dust sublimation */
-ENTRY(dust_sublimation, INT, FALSE)
-
 /* add heating from UV background model
    0) off, 1) on */
 ENTRY(UVbackground, INT, 0)
@@ -252,13 +246,35 @@ ENTRY(cloudy_electron_fraction_factor, DOUBLE, 9.153959e-3)
 ENTRY(use_radiative_transfer, INT, 0)
 ENTRY(radiative_transfer_coupled_rate_solver, INT, 0)
 ENTRY(radiative_transfer_intermediate_step, INT, 0)
-ENTRY(radiative_transfer_hydrogen_only, INT, 0)
-ENTRY(radiative_transfer_HDI_dissociation, INT, 0)
-ENTRY(radiative_transfer_metal_ionization, INT, 0)
-ENTRY(radiative_transfer_metal_dissociation, INT, 0)
 
 /* flag to signal H2 self-shielding is being done in hydro code */
 ENTRY(radiative_transfer_use_H2_shielding, INT, FALSE)
+
+/* flags to control how photo rates are calculated
+   0: rate not included
+   1: rate included from UVB table only
+   2: rate included from field array only
+   3: rate is the sum of UVB table and field array values
+*/
+ENTRY(use_HI_ionization, INT, -1)
+ENTRY(use_HeII_ionization, INT, -1)
+ENTRY(use_HeI_ionization, INT, -1)
+ENTRY(use_HM_detachment, INT, -1)
+ENTRY(use_H2II_dissociation, INT, -1)
+ENTRY(use_H2I_ionization, INT, -1)
+ENTRY(use_H2II_dissociative_ionization, INT, -1)
+ENTRY(use_H2I_dissociation, INT, -1)
+ENTRY(use_CI_ionization, INT, -1)
+ENTRY(use_OI_ionization, INT, -1)
+ENTRY(use_COI_dissociation, INT, -1)
+ENTRY(use_OHI_dissociation, INT, -1)
+ENTRY(use_H2OI_dissociation, INT, -1)
+
+/* flag to signal that fields are being provided for all photo rates.
+   This will set all the above photo rates to 2 if UVbackground is off and
+   3 if UVBackground is on.
+*/
+ENTRY(use_photo_fields, INT, 0)
 
 /* flag for approximiate self-shielding as well
    as spectrum averaged photo heating and
@@ -269,11 +285,6 @@ ENTRY(self_shielding_method, INT, 0)
    These determine the length scale used in the calculation of the H2 column
    density. Please refer to the grackle documentation for specifics. */
 ENTRY(H2_self_shielding, INT, 0)
-
-/* flag for custom H2-shielding factor. The factor is provided as an additional
-   field by the user and is multiplied to the rate for radiative H2
-   dissociation */
-ENTRY(H2_custom_shielding, INT, 0)
 
 /* flag to select which formula for calculating k11 you want to use. 
    Setting to 1 will use Savin 2004, 2 will use Abel et al. 1996  */
@@ -308,15 +319,6 @@ ENTRY(hd_reaction_rates, INT, 0)
  * 1: Omukai (2000) - see rate_functions.c for more details
  */
 ENTRY(gas_grain_cooling_rate, INT, 0)
-
-/* Alternative formulations of interstellar radiation heating
-   rate on uniform sized grains. Both are based on Goldsmith (2001)
-   and Krumholz (2014) and are in fact very similar. See
-   rate_functions.c for more details.
- * 0: 3.9e-24 / mh / fgr, where fgr is local dust-to-gas ratio
- * 1: 8.60892e-24 / (2.0 * mh) / fgr
- */
-ENTRY(uniform_grain_isrf_heating_rate, INT, 0)
 
 /* maximum number of subcycle iterations for solve_chemistry */
 ENTRY(max_iterations, INT, 10000)

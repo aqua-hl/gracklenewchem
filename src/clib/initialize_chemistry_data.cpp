@@ -19,15 +19,18 @@
 #include "grackle.h"
 #include "grackle_macros.h"
 #include "auto_general.hpp"
+#include "chem_model/nuclide_model.hpp"
+#include "chem_model/species.hpp"
+#include "dust/grain_species_info.hpp"
 #include "init_misc_species_cool_rates.hpp"  // free_misc_species_cool_rates
 #include "initialize_rates.hpp"
 #include "initialize_UVbackground_data.hpp"
 #include "inject_model/grain_metal_inject_pathways.hpp"
 #include "internal_types.hpp" // drop_CollisionalRxnRateCollection
-#include "interp_table_utils.hpp" // free_interp_grid_
 #include "opaque_storage.hpp" // gr_opaque_storage
-#include "phys_constants.h"
+#include "phys_constants.hpp"
 #include "ratequery.hpp"
+#include "support/expected.hpp"
 #include "support/status_reporting.hpp"
 #include "tabulated/initialize_cloudy_data.hpp"
 
@@ -69,6 +72,12 @@ static void initialize_empty_chemistry_data_storage_struct(chemistry_data_storag
   my_rates->k29 = 0.;
   my_rates->k30 = 0.;
   my_rates->k31 = 0.;
+
+  my_rates->kphCI_bg = 0.;
+  my_rates->kphOI_bg = 0.;
+  my_rates->kdissCO_bg = 0.;
+  my_rates->kdissOH_bg = 0.;
+  my_rates->kdissH2O_bg = 0.;
 
   my_rates->h2dust = NULL;
   my_rates->h2dustS = NULL;
@@ -137,34 +146,59 @@ static void initialize_empty_chemistry_data_storage_struct(chemistry_data_storag
 
   my_rates->cieY06 = NULL;
 
-  grackle::impl::initialize_empty_interp_grid_(&my_rates->LH2);
-  grackle::impl::initialize_empty_interp_grid_(&my_rates->LHD);
-
-  grackle::impl::initialize_empty_interp_grid_(&my_rates->LCI);
-  grackle::impl::initialize_empty_interp_grid_(&my_rates->LCII);
-  grackle::impl::initialize_empty_interp_grid_(&my_rates->LOI);
-
-  grackle::impl::initialize_empty_interp_grid_(&my_rates->LCO);
-  grackle::impl::initialize_empty_interp_grid_(&my_rates->LOH);
-  grackle::impl::initialize_empty_interp_grid_(&my_rates->LH2O);
-
-  grackle::impl::initialize_empty_interp_grid_(&my_rates->alphap);
-
   my_rates->cloudy_data_new = -1;
 
   my_rates->opaque_storage = NULL;
 }
 
-/// core logic of local_initialize_chemistry_data_
-///
-/// @note
-/// This has been separated from local_initialize_chemistry_data to ensure that
-/// any memory allocations tracked by reg_builder can be appropriately freed
-/// (this is somewhat unavoidable in C++ without destructors)
-static int local_initialize_chemistry_data_(
+int configure_photo_rate_parameter(chemistry_data *my_chemistry,
+                                   const bool par_condition,
+                                   int &photo_parameter,
+                                   const char *par_name) {
+  if (photo_parameter == -1) {
+    photo_parameter = 0;
+    // only activate parameter if the specified condition is also met
+    if (par_condition) {
+      if (my_chemistry->UVbackground == 1) {
+        photo_parameter += 1;
+      }
+      if (my_chemistry->use_photo_fields == 1) {
+        photo_parameter += 2;
+      }
+    }
+    if (grackle_verbose) {
+      fprintf(stdout, "Setting %s to %d.\n", par_name, photo_parameter);
+    }
+  }
+
+  else {
+    if (photo_parameter > 0 && !par_condition) {
+      fprintf(stderr, "ERROR: other settings require %s to be set to 0.\n", par_name);
+      return GR_FAIL;
+    }
+  }
+
+  if (photo_parameter < 0 || photo_parameter > 3) {
+    fprintf(stderr, "ERROR: %s must be set to 0, 1, 2, or 3.\n", par_name);
+    return GR_FAIL;
+  }
+
+  return GR_SUCCESS;
+}
+
+extern "C" int local_initialize_chemistry_data(
     chemistry_data *my_chemistry, chemistry_data_storage *my_rates,
-    code_units *my_units, grackle::impl::ratequery::RegBuilder* reg_builder)
+    code_units *my_units)
 {
+  using GRIMPL_NS::Error;
+  using GRIMPL_NS::Expected;
+
+  // Here we will default construct an empty RegBuilder
+  // -> as we move through this function, we will register various
+  //    kinds of rate-related quantities
+  // -> if all goes well with initialization, we'll use it to construct
+  //    a ratequery::Registry object
+  GRIMPL_NS::ratequery::RegBuilder reg_builder;
 
   /* Better safe than sorry: Initialize everything to NULL/0 */
   initialize_empty_chemistry_data_storage_struct(my_rates);
@@ -172,6 +206,13 @@ static int local_initialize_chemistry_data_(
   if (grackle_verbose) {
     show_version(stdout);
     fprintf(stdout, "Initializing grackle data.\n");
+  }
+
+  if (my_chemistry->h2_on_dust != 0) {
+    if (grackle_verbose) {
+      fprintf(stderr, "ERROR: h2_on_dust parameter has been removed.\n");
+      return GR_FAIL;
+    }
   }
 
   /* Set the minimum temperature for using tabulated metal cooling. */
@@ -188,7 +229,8 @@ static int local_initialize_chemistry_data_(
     }
   }
 
-  // Activate dust chemistry machinery.
+  // Check settings required for all dust models and
+  // activate dust-related cooling/heating processes.
   if (my_chemistry->dust_chemistry > 0) {
 
     if (my_chemistry->metal_cooling < 1) {
@@ -210,14 +252,43 @@ static int local_initialize_chemistry_data_(
       }
     }
 
-    if (my_chemistry->primordial_chemistry > 1 &&
-        my_chemistry->h2_on_dust == 0) {
-      my_chemistry->h2_on_dust = 1;
-      if (grackle_verbose) {
-        fprintf(stdout, "Dust chemistry enabled, setting h2_on_dust to 1.\n");
-      }
+  }
+
+  if (my_chemistry->dust_chemistry == 0) {
+    if (my_chemistry->photoelectric_heating > 0) {
+      fprintf(stderr, "ERROR: photoelectric_heating > 0 requires dust_chemistry > 0.\n");
+      return GR_FAIL;
     }
 
+    if (my_chemistry->dust_recombination_cooling > 0) {
+      fprintf(stderr, "ERROR: dust_recombination_cooling > 0 requires dust_chemistry > 0.\n");
+      return GR_FAIL;
+    }
+  }
+
+  // Check settings required for Gen Chiaki dust model.
+  if (my_chemistry->dust_chemistry == 2) {
+    if (my_chemistry->dust_species < 1) {
+      fprintf(stderr, "ERROR: dust_chemistry = 2 requires dust_species > 0.\n");
+      return GR_FAIL;
+    }
+
+    if (my_chemistry->use_dust_density_field == 1) {
+      fprintf(stderr, "ERROR: dust_chemistry = 2 requires use_dust_density_field = 0.\n");
+      return GR_FAIL;
+    }
+
+    if (my_chemistry->metal_chemistry < 1) {
+      fprintf(stderr, "ERROR: dust_chemistry = 2 requires metal_chemistry > 0.\n");
+      return GR_FAIL;
+    }
+  }
+
+  if (my_chemistry->metal_chemistry == 1) {
+    if (my_chemistry->metal_cooling == 0) {
+      fprintf(stderr, "ERROR: metal_chemistry = 1 requires metal_cooling = 1.\n");
+      return GR_FAIL;
+    }
   }
 
   if (my_chemistry->primordial_chemistry == 0 &&
@@ -226,37 +297,11 @@ static int local_initialize_chemistry_data_(
     return GR_FAIL;
   }
 
-  if (my_chemistry->dust_species > 0 &&
-      my_chemistry->use_dust_density_field == 0) {
-    fprintf(stderr, "ERROR: dust_species > 0 requires use_dust_density_field > 0.\n");
-    return GR_FAIL;
-  }
-
-  if (my_chemistry->dust_species == 0 &&
-      my_chemistry->use_multiple_dust_temperatures > 0) {
-    fprintf(stderr, "ERROR: dust_species = 0 requires use_multiple_dust_temperatures = 0.\n");
-    return GR_FAIL;
-  }
-
-  // dust_species_track=1 is the new species path (Mg-silicate + Fe-silicate
-  // + carbonaceous) and is mutually exclusive with the legacy grain_growth /
-  // dust_sublimation correction loop in make_consistent — that block scales
-  // legacy dust fields (MgSiO3, AC, Mg2SiO4, Fe3O4, SiO2D, MgO, FeS, Al2O3,
-  // SiM, FeM) against per-element ratios that the Phase F hijack has just
-  // overwritten with values derived from the new species fields. Running
-  // both paths simultaneously silently corrupts both reservoirs.
   if (my_chemistry->dust_species_track == 1 &&
-      my_chemistry->grain_growth == 1) {
+      my_chemistry->dust_chemistry == 2) {
     fprintf(stderr,
-            "ERROR: dust_species_track = 1 is mutually exclusive with "
-            "grain_growth = 1 (set grain_growth = 0).\n");
-    return GR_FAIL;
-  }
-  if (my_chemistry->dust_species_track == 1 &&
-      my_chemistry->dust_sublimation == 1) {
-    fprintf(stderr,
-            "ERROR: dust_species_track = 1 is mutually exclusive with "
-            "dust_sublimation = 1 (set dust_sublimation = 0).\n");
+            "ERROR: dust_species_track = 1 is incompatible with "
+            "dust_chemistry = 2.\n");
     return GR_FAIL;
   }
   if (my_chemistry->dust_species_track == 1 &&
@@ -269,6 +314,86 @@ static int local_initialize_chemistry_data_(
   // Default photo-electric heating to off if unset.
   if (my_chemistry->photoelectric_heating < 0) {
     my_chemistry->photoelectric_heating = 0;
+  }
+
+  // Configure photo rate parameters
+  if (configure_photo_rate_parameter(
+        my_chemistry, (my_chemistry->primordial_chemistry > 0),
+        my_chemistry->use_HI_ionization,
+        "use_HI_ionization") == GR_FAIL) {
+    return GR_FAIL;
+  }
+  if (configure_photo_rate_parameter(
+        my_chemistry, (my_chemistry->primordial_chemistry > 0),
+        my_chemistry->use_HeII_ionization,
+        "use_HeII_ionization") == GR_FAIL) {
+    return GR_FAIL;
+  }
+  if (configure_photo_rate_parameter(
+        my_chemistry, (my_chemistry->primordial_chemistry > 0),
+        my_chemistry->use_HeI_ionization,
+        "use_HeI_ionization") == GR_FAIL) {
+    return GR_FAIL;
+  }
+  if (configure_photo_rate_parameter(
+        my_chemistry, (my_chemistry->primordial_chemistry > 1),
+        my_chemistry->use_HM_detachment,
+        "use_HM_detachment") == GR_FAIL) {
+    return GR_FAIL;
+  }
+  if (configure_photo_rate_parameter(
+        my_chemistry, (my_chemistry->primordial_chemistry > 1),
+        my_chemistry->use_H2II_dissociation,
+        "use_H2II_dissociation") == GR_FAIL) {
+    return GR_FAIL;
+  }
+  if (configure_photo_rate_parameter(
+        my_chemistry, (my_chemistry->primordial_chemistry > 1),
+        my_chemistry->use_H2I_ionization,
+        "use_H2I_ionization") == GR_FAIL) {
+    return GR_FAIL;
+  }
+  if (configure_photo_rate_parameter(
+        my_chemistry, (my_chemistry->primordial_chemistry > 1),
+        my_chemistry->use_H2II_dissociative_ionization,
+        "use_H2II_dissociative_ionization") == GR_FAIL) {
+    return GR_FAIL;
+  }
+  if (configure_photo_rate_parameter(
+        my_chemistry, (my_chemistry->primordial_chemistry > 1),
+        my_chemistry->use_H2I_dissociation,
+        "use_H2I_dissociation") == GR_FAIL) {
+    return GR_FAIL;
+  }
+  if (configure_photo_rate_parameter(
+        my_chemistry, (my_chemistry->metal_chemistry == 1),
+        my_chemistry->use_CI_ionization,
+        "use_CI_ionization") == GR_FAIL) {
+    return GR_FAIL;
+  }
+  if (configure_photo_rate_parameter(
+        my_chemistry, (my_chemistry->metal_chemistry == 1),
+        my_chemistry->use_OI_ionization,
+        "use_OI_ionization") == GR_FAIL) {
+    return GR_FAIL;
+  }
+  if (configure_photo_rate_parameter(
+        my_chemistry, (my_chemistry->metal_chemistry == 1),
+        my_chemistry->use_COI_dissociation,
+        "use_COI_dissociation") == GR_FAIL) {
+    return GR_FAIL;
+  }
+  if (configure_photo_rate_parameter(
+        my_chemistry, (my_chemistry->metal_chemistry == 1),
+        my_chemistry->use_OHI_dissociation,
+        "use_OHI_dissociation") == GR_FAIL) {
+    return GR_FAIL;
+  }
+  if (configure_photo_rate_parameter(
+        my_chemistry, (my_chemistry->metal_chemistry == 1),
+        my_chemistry->use_H2OI_dissociation,
+        "use_H2OI_dissociation") == GR_FAIL) {
+    return GR_FAIL;
   }
 
 //initialize OpenMP
@@ -363,14 +488,59 @@ static int local_initialize_chemistry_data_(
 
   // perform some basic allocations
   my_rates->opaque_storage = new gr_opaque_storage;
-  my_rates->opaque_storage->kcol_rate_tables = nullptr;
-  my_rates->opaque_storage->used_kcol_rate_indices = nullptr;
-  my_rates->opaque_storage->n_kcol_rate_indices = 0;
-  grackle::impl::init_empty_interp_grid_props_(
-    &my_rates->opaque_storage->h2dust_grain_interp_props);
-  my_rates->opaque_storage->grain_species_info = nullptr;
-  my_rates->opaque_storage->inject_pathway_props = nullptr;
-  my_rates->opaque_storage->registry = nullptr;
+
+  // lets start determining the species that are actually involved in the
+  // calculation
+  // -> first we need to infer whether any dust grain species are involved
+  // -> this is encoded within GrainSpeciesInfo
+  if (my_chemistry->dust_species > 0) {
+    using GRIMPL_NS::GrainSpeciesInfo;
+    GRIMPL_NS::Expected<GrainSpeciesInfo, Error> rslt
+        = GrainSpeciesInfo::create(my_chemistry->dust_species);
+    if (rslt.has_value()) {
+      my_rates->opaque_storage->grain_species_info = new GrainSpeciesInfo(
+          std::move(rslt).value());
+    } else {
+      rslt.error().context_literal("Unable to build GrainSpeciesInfo")
+          .write(stderr);
+      return GR_FAIL;
+    }
+  }
+
+  // let's infer information about all species
+  // -> species_initialize_info contains queryable information about the species
+  //    involved in the reaction network
+  // -> note that this allocates some heap memory. However the object (& all of
+  //    its contents are deallocated) in the destructor which are invoked at
+  //    the end of the current function
+  // -> while this is currently a little wasteful, it's probably worth doing
+  //    because in the near future, the plan is to use this information to help
+  //    with setting up make_consistent (and potentially the step_rate_solvers)
+  //    in a dynamic way (i.e. to minimize the number of edits every time a new
+  //    species is added)
+  Expected<GRIMPL_NS::SpInitializeInfo, Error> species_initialize_info_rslt
+      = infer_species_maps(my_chemistry->primordial_chemistry,
+                           my_chemistry->metal_chemistry,
+                           my_rates->opaque_storage->grain_species_info);
+  if (!species_initialize_info_rslt.has_value()) {
+    species_initialize_info_rslt.error().context_literal("problem inferring species information")
+          .write(stderr);
+    return GR_FAIL;
+  }
+  const GRIMPL_NS::SpInitializeInfo& species_initialize_info 
+    = species_initialize_info_rslt.value();
+  
+  // the following copies some data into the reg_builder (it will get
+  // transferred to the registry). If we are worried about the cost of this, we
+  // can create a new parameter to disable this behavior
+  species_initialize_info.nuclide_model.copy_info_to_RegBuilder(reg_builder);
+
+  // make a deep copy of the species kind map (this is very cheap)
+  my_rates->opaque_storage->sp_kind_map =
+      species_initialize_info_rslt.value().kind_map;
+
+  // TODO: we should make an effort to start using the information within
+  //       species_initialize_info_rslt
 
   double co_length_units, co_density_units;
   if (my_units->comoving_coordinates == TRUE) {
@@ -387,7 +557,7 @@ static int local_initialize_chemistry_data_(
   // Compute rate tables.
   if (grackle::impl::initialize_rates(my_chemistry, my_rates, my_units,
                                       co_length_units, co_density_units,
-                                      reg_builder)
+                                      &reg_builder)
       != GR_SUCCESS) {
     fprintf(stderr, "Error in initialize_rates.\n");
     return GR_FAIL;
@@ -425,14 +595,16 @@ static int local_initialize_chemistry_data_(
   /* store a copy of the initial units */
   my_rates->initial_units = *my_units;
 
-  // initialize the registry
-  if (grackle::impl::ratequery::RegBuilder_misc_recipies(reg_builder,
-                                                         my_chemistry)
+  // add some miscellaneous recipes for looking up rates to reg_builder
+  if (GRIMPL_NS::ratequery::add_misc_recipies_to_RegBuilder(&reg_builder,
+                                                            my_chemistry)
       != GR_SUCCESS){
-    return GrPrintAndReturnErr("error in RegBuilder_misc_recipies");
+    return GrPrintAndReturnErr("error in add_misc_recipies_to_RegBuilder");
   }
-  my_rates->opaque_storage->registry = new grackle::impl::ratequery::Registry(
-    grackle::impl::ratequery::RegBuilder_consume_and_build(reg_builder)
+
+  // initialize the registry
+  my_rates->opaque_storage->registry = new GRIMPL_NS::ratequery::Registry(
+    reg_builder.consume_and_build()
   );
 
   if (grackle_verbose) {
@@ -498,20 +670,6 @@ static int local_initialize_chemistry_data_(
   }
 
   return GR_SUCCESS;
-}
-
-
-extern "C" int local_initialize_chemistry_data(chemistry_data *my_chemistry,
-                                               chemistry_data_storage *my_rates,
-                                               code_units *my_units)
-{
-  namespace rate_q = grackle::impl::ratequery;
-  rate_q::RegBuilder reg_builder = rate_q::new_RegBuilder();
-
-  int out = local_initialize_chemistry_data_(my_chemistry, my_rates, my_units,
-                                             &reg_builder);
-  rate_q::drop_RegBuilder(&reg_builder);
-  return out;
 }
 
 extern "C" int initialize_chemistry_data(code_units *my_units)
@@ -585,14 +743,6 @@ extern "C" int local_free_chemistry_data(chemistry_data *my_chemistry,
     GRACKLE_FREE(my_rates->gas_grain);
     GRACKLE_FREE(my_rates->gas_grain2);
 
-    grackle::impl::free_interp_grid_(&my_rates->LH2);
-    grackle::impl::free_interp_grid_(&my_rates->LHD);
-
-    // we deal with freeing other interp grids inside of
-    // free_misc_species_cool_rates
-
-    grackle::impl::free_interp_grid_(&my_rates->alphap);
-
     GRACKLE_FREE(my_rates->k13dd);
     GRACKLE_FREE(my_rates->h2dust);
     GRACKLE_FREE(my_rates->n_cr_n);
@@ -612,54 +762,6 @@ extern "C" int local_free_chemistry_data(chemistry_data *my_chemistry,
   if (grackle::impl::free_misc_species_cool_rates(my_chemistry, my_rates) != GR_SUCCESS) {
     fprintf(stderr, "Error in free_metal_chemistry_rates.\n");
     return GR_FAIL;
-  }
-
-  // start freeing memory associated with opaque storage
-  // ---------------------------------------------------
-  if (my_rates->opaque_storage->kcol_rate_tables != nullptr) {
-    // delete contents of kcol_rate_tables
-    drop_CollisionalRxnRateCollection(my_rates->opaque_storage->kcol_rate_tables);
-    // delete kcol_rate_tables, itself
-    delete my_rates->opaque_storage->kcol_rate_tables;
-  }
-
-  if (my_rates->opaque_storage->used_kcol_rate_indices !=nullptr) {
-    // since used_kcol_rate_indices are just integers, we can directly
-    // deallocate them
-    delete[] my_rates->opaque_storage->used_kcol_rate_indices;
-  }
-
-  // delete contents of h2dust_grain_interp_props (automatically handles the
-  // case where we didn't allocate anything)
-  grackle::impl::free_interp_grid_props_(
-      &my_rates->opaque_storage->h2dust_grain_interp_props,
-      /* use_delete = */ false);
-  // since h2dust_grain_interp_props isn't a pointer, there is nothing more to
-  // allocate right here
-
-  if (my_rates->opaque_storage->grain_species_info != nullptr) {
-    // delete contents of grain_species_info
-    grackle::impl::drop_GrainSpeciesInfo(
-      my_rates->opaque_storage->grain_species_info);
-    // delete grain_species_info, itself
-    delete my_rates->opaque_storage->grain_species_info;
-  }
-
-  if (my_rates->opaque_storage->inject_pathway_props != nullptr) {
-    // delete contents of inject_pathway_props
-    grackle::impl::drop_GrainMetalInjectPathways(
-      my_rates->opaque_storage->inject_pathway_props);
-    // delete inject_pathway_props, itself
-    delete my_rates->opaque_storage->inject_pathway_props;
-  }
-
-  if (my_rates->opaque_storage->registry != nullptr) {
-    // delete contents of registry
-    grackle::impl::ratequery::drop_Registry(
-      my_rates->opaque_storage->registry
-    );
-    // delete registry, itself
-    delete my_rates->opaque_storage->registry;
   }
 
   delete my_rates->opaque_storage;

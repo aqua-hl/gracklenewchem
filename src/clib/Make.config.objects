@@ -16,24 +16,26 @@ OBJS_CONFIG_LIB = \
         api/calculate_cooling_rate_contributions.lo \
         api/calculate_cooling_time.lo \
         api/calculate_dust_temperature.lo \
-        api/calculate_gamma.lo \
-        api/calculate_pressure.lo \
-        api/calculate_temperature.lo \
+        api/calculate_T_related.lo \
         api/set_default_chemistry_parameters.lo \
         api/solve_chemistry.lo \
         tabulated/calc_temp1d_cloudy.lo \
+        chem_model/chemsp_props.lo \
+        chem_model/nuclide_model.lo \
+        chem_model/parse.lo \
+        chem_model/species_builder.lo \
+        chem_model/species.lo \
         collisional_rate_props.lo \
         tabulated/cool1d_cloudy.lo \
         tabulated/cool1d_cloudy_old_tables.lo \
         cool1d_multi_g.lo \
         cool_multi_time.lo \
-        dust/calc_all_tdust_gasgr_1d_g.lo \
-        dust/calc_gr_balance_g.lo \
+        dust/calc_all_tdust_gasgr_1d.lo \
         dust/multi_grain_species/calc_grain_size_increment_species_1d.lo \
-        dust/calc_kappa_grain.lo \
-        dust/calc_tdust_1d_g.lo \
+        dust/calc_tdust_3d.lo \
         dust/dust_growth_and_destruction.lo \
         dust/grain_species_info.lo \
+        dust/solver.lo \
         dynamic_api.lo \
         api/units.lo \
         initialize_chemistry_data.lo \
@@ -43,19 +45,20 @@ OBJS_CONFIG_LIB = \
         initialize_UVbackground_data.lo \
         inject_model/load_data.lo \
         inject_model/raw_data.lo \
-        interpolators_g.lo \
         lnT_prep.lo \
         rate_timestep_g.lo \
         make_consistent.lo \
+        opaque_storage.lo \
         scale_fields.lo \
+        math/gaussj.lo \
+        math/solve_eqn.lo \
         solve_rate_cool.lo \
+        support/error.lo \
+        support/formatf.lo \
         support/status_reporting.lo \
         update_UVbackground_rates.lo \
-        dust/calc_tdust_3d.lo \
-        calc_grain_size_increment_1d.lo \
         rate_functions.lo \
         ratequery.lo \
-        gaussj_g.lo \
         support/h5io.lo \
         utils-cpp.lo \
         internal_types.lo

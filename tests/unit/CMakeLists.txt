@@ -2,6 +2,13 @@
 # ==================================
 
 # NOTE: the testdeps target is defined within ../grtestutils/CMakeLists.txt
+add_executable(testError support/test_error.cpp)
+target_link_libraries(testError testdeps)
+gtest_discover_tests(testError)
+
+add_executable(testExpected support/test_expected.cpp)
+target_link_libraries(testExpected testdeps)
+gtest_discover_tests(testExpected)
 
 add_executable(testFrozenKeyIdxBiMap
   support/test_unit_hash.cpp support/test_unit_FrozenKeyIdxBiMap.cpp)
@@ -12,17 +19,28 @@ add_executable(runIndexHelperTests support/test_index_helper.cpp)
 target_link_libraries(runIndexHelperTests testdeps)
 gtest_discover_tests(runIndexHelperTests)
 
-add_executable(runInterpolationTests test_unit_interpolators_g.cpp)
+add_executable(runInterpolationTests
+  test_unit_interpolators.cpp test_interp_grid.cpp)
 target_link_libraries(runInterpolationTests testdeps)
 gtest_discover_tests(runInterpolationTests)
 
-add_executable(runLinAlgTests test_linalg.cpp)
-target_link_libraries(runLinAlgTests testdeps)
-gtest_discover_tests(runLinAlgTests)
+add_executable(runMathTests
+  math/test_integrate.cpp
+  math/test_linalg.cpp
+  math/test_cubic_eqn_root.cpp)
+target_link_libraries(runMathTests testdeps)
+gtest_discover_tests(runMathTests)
 
 add_executable(runGrainSpeciesIntoTests test_grain_species_info.cpp)
 target_link_libraries(runGrainSpeciesIntoTests testdeps)
 gtest_discover_tests(runGrainSpeciesIntoTests)
+
+add_executable(runChemModelTests
+  chem_model/test_chemsp_props.cpp
+  chem_model/test_parse_roman.cpp
+  chem_model/test_sp_lut_consistency.cpp)
+target_link_libraries(runChemModelTests testdeps)
+gtest_discover_tests(runChemModelTests)
 
 add_executable(testPartMap support/test_unit_PartMap.cpp)
 target_link_libraries(testPartMap testdeps)
@@ -31,6 +49,10 @@ gtest_discover_tests(testPartMap)
 add_executable(runStatusReporting support/test_status_reporting.cpp)
 target_link_libraries(runStatusReporting testdeps)
 gtest_discover_tests(runStatusReporting)
+
+add_executable(testView support/test_View.cpp)
+target_link_libraries(testView testdeps)
+gtest_discover_tests(testView)
 
 # these may be slightly more of an integration test than a unit test
 add_executable(runVisitorTests test_visitor.cpp)

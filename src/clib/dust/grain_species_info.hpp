@@ -14,8 +14,11 @@
 #define GRAIN_SPECIES_INFO_HPP
 
 #include "../support/FrozenKeyIdxBiMap.hpp"
+#include "../support/config.hpp"
+#include "../support/error.hpp"
+#include "../support/expected.hpp"
 
-namespace grackle::impl {
+namespace GRIMPL_NAMESPACE_DECL {
 
 /// holds information about a single gas species that is an ingredient for
 /// grain growth
@@ -81,7 +84,7 @@ struct GrainSpeciesInfoEntry {
 /// Relationship with OnlyGrainSpLUT
 /// --------------------------------
 /// In the short term, the index of each species in the
-/// @ref GrainSpeciesInfo::species_info out.species_info is dictated by the
+/// @ref GrainSpeciesInfo::species_info() is dictated by the
 /// order of enumerators in the OnlyGrainSpLUT enumeration.
 ///
 /// In the medium term, we plan to entirely eliminate the OnlyGrainSpLUT
@@ -91,20 +94,23 @@ struct GrainSpeciesInfoEntry {
 /// possible grain species and perform nearly identical operations on each
 /// species. In each case, it is straight-forward to replace these blocks of
 /// logic with for-loops (we just need to encode species-specific variations in
-/// the calculations in out.species_info that have the same ordering as the
+/// the calculations in species_info that have the same ordering as the
 /// species). To phrase it another way, in nearly all of the places where we
 /// would use OnlyGrainSpLUT, we don't need to know the grain species identity.
 ///
 /// The exception to this is when we compute the h2dust rate. In this case
 /// we need to identify AC_dust since we need to do something **slightly**
 /// different from the other grains, but this is easy to work around
-struct GrainSpeciesInfo {
+class GrainSpeciesInfo {
   /// number of grain species considered for the current Grackle configuration
-  int n_species;
+  int n_species_ = 0;
 
-  /// an out.species_info of length of length @ref n_species where each entry
-  /// holds info about a separate grain species
-  GrainSpeciesInfoEntry* species_info;
+  /// holds @ref n_species entries. Each entry holds info about a separate
+  /// grain species
+  GrainSpeciesInfoEntry* species_info_ = nullptr;
+
+  /// a copy of the dust_species parameter used to construct this instance
+  int dust_species_parameter_;
 
   /// maps between grain species names and the associated index. The mapping is
   /// **ALWAYS** consistent with ``OnlyGrainSpLUT``.
@@ -113,7 +119,68 @@ struct GrainSpeciesInfo {
   /// An argument could be made for storing this separately from the rest of
   /// the struct since the core grackle calculations don't (or at least
   /// shouldn't) use this data structure during the calculation.
-  FrozenKeyIdxBiMap name_map;
+  FrozenKeyIdxBiMap name_map_;
+
+private:  // helper methods
+  /// @brief helper method to deallocate a species_info array
+  ///
+  /// @note We could get rid of this by converting @ref GrainSpeciesInfoEntry
+  /// to a proper class, or by using std::unique_ptr and encoding the cleanup
+  /// of grow_ingredients in a custom deleter (this would be a little tricky
+  /// since the deleter would need to know the array's length)
+  static void cleanup_array_(int n_species,
+                             GrainSpeciesInfoEntry* species_info) {
+    if (n_species > 0) {
+      for (int gsp_idx = 0; gsp_idx < n_species; gsp_idx++) {
+        if ((species_info[gsp_idx].growth_ingredients) != nullptr) {
+          delete[] species_info[gsp_idx].growth_ingredients;
+        }
+      }
+      delete[] species_info;
+    }
+  }
+
+  explicit GrainSpeciesInfo() noexcept = default;  // <- used by factory method
+public:
+  /// @brief number of grain species considered in current Grackle configuration
+  int n_species() const { return n_species_; }
+
+  int dust_species_parameter() const { return dust_species_parameter_; }
+
+  /// @brief returns sequence of entries describing each grain species
+  const GrainSpeciesInfoEntry* species_info() const { return species_info_; }
+
+  /// @brief returns mapping between grain species names and associated indices
+  const FrozenKeyIdxBiMap& name_map() const { return name_map_; }
+
+  /// @brief Factory Method
+  static Expected<GrainSpeciesInfo, Error> create(int dust_species_parameter);
+
+  // default implementations of copy construction/assignment won't properly
+  // handle species_info
+  GrainSpeciesInfo(const GrainSpeciesInfo&) = delete;
+  GrainSpeciesInfo& operator=(const GrainSpeciesInfo&) = delete;
+
+  // move operations
+  GrainSpeciesInfo(GrainSpeciesInfo&& o) : GrainSpeciesInfo() { swap(o); }
+  GrainSpeciesInfo& operator=(GrainSpeciesInfo&& o) {
+    swap(o);
+    return *this;
+  }
+
+  ~GrainSpeciesInfo() {
+    if (n_species_ > 0) {
+      GrainSpeciesInfo::cleanup_array_(n_species_, species_info_);
+    }
+  }
+
+  /// @brief swaps contents
+  void swap(GrainSpeciesInfo& other) noexcept {
+    std::swap(n_species_, other.n_species_);
+    std::swap(species_info_, other.species_info_);
+    std::swap(dust_species_parameter_, other.dust_species_parameter_);
+    name_map_.swap(other.name_map_);
+  }
 };
 
 /// return the number of grain species
@@ -142,33 +209,6 @@ inline int get_n_grain_species(int dust_species_parameter) {
 /// The correctness of this constant is explicitly checked in a unit test
 inline constexpr int max_ingredients_per_grain_species = 3;
 
-/// Constructs an returns a fully initialized GrainSpeciesInfo instance.
-///
-/// @param[in]  dust_species_parameter The parameter tracked by #chemistry_data
-/// @returns A fully initialized GrainSpeciesInfo instance
-GrainSpeciesInfo new_GrainSpeciesInfo(int dust_species_parameter);
-
-/// performs cleanup of the contents of GrainSpeciesInfo
-///
-/// This effectively invokes the destructor
-inline void drop_GrainSpeciesInfo(GrainSpeciesInfo* ptr) {
-  if (ptr->n_species == 0) {
-    return;  // avoids double-free
-  }
-
-  for (int gsp_idx = 0; gsp_idx < ptr->n_species; gsp_idx++) {
-    if ((ptr->species_info[gsp_idx].growth_ingredients) != nullptr) {
-      delete[] ptr->species_info[gsp_idx].growth_ingredients;
-    }
-  }
-  delete[] ptr->species_info;
-  drop_FrozenKeyIdxBiMap(&ptr->name_map);
-  // the following 2 lines are not strictly necessary, but they may help us
-  // avoid a double-free and a dangling pointer
-  ptr->n_species = 0;
-  ptr->species_info = nullptr;
-}
-
-}  // namespace grackle::impl
+}  // namespace GRIMPL_NAMESPACE_DECL
 
 #endif /* GRAIN_SPECIES_INFO_HPP */

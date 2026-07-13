@@ -17,6 +17,7 @@
 #include "support/index_helper.hpp"
 #include "internal_units.hpp"
 #include "lnT_prep.hpp"
+#include "phys_constants.hpp"
 #include "support/config.hpp"
 #include "tabulated/calc_temp1d_cloudy.hpp"
 #include "utils-cpp.hpp"
@@ -108,6 +109,9 @@ inline double self_consistent_Tgas(double tgas0, double nH2, double n_other,
 
 }  // namespace chemistry_T_detail
 
+/// @brief describes the kind of density units being used
+enum struct DensityUnitKind { PROPER, COMOVING };
+
 /// calculate basic gas properties for the specified @p idx_range
 ///
 /// Basic properties include @p tgas, @p mmw, and @p rhoH. For some context,
@@ -120,7 +124,6 @@ inline double self_consistent_Tgas(double tgas0, double nH2, double n_other,
 ///     in the @p idx_range
 /// @param[out] rhoH 1D array to hold the computed Hydrogen mass density
 ///     for the @p idx_range
-/// @param[in] imetal Indicates whether metals are evolved
 /// @param[in] itmask Specifies the general iteration-mask of the @p idx_range
 ///     for this calculation.
 /// @param[in] my_chemistry holds a number of configuration parameters.
@@ -129,32 +132,33 @@ inline double self_consistent_Tgas(double tgas0, double nH2, double n_other,
 /// @param[in] my_fields Specifies the field data.
 /// @param[in] internalu Specifies Grackle's internal unit-system
 /// @param[in] idx_range Specifies the current index-range
-inline void basic_gas_props(double* tgas, double* mmw, double* rhoH, int imetal,
+/// @param[in] du_kind Specifies whether densities (i.e. the provided fields
+///     and the computed @p rhoH values) have proper code units (the default) or
+///     comoving code units. This only exists to make it easier to
+///     reuse this logic for implementing Grackle's API level functions.
+inline void basic_gas_props(double* tgas, double* mmw, double* rhoH,
                             const gr_mask_type* itmask,
                             const chemistry_data* my_chemistry,
                             const cloudy_data* primordial_cloudy_data,
                             const grackle_field_data* my_fields,
-                            InternalGrUnits internalu, IndexRange idx_range) {
+                            InternalGrUnits internalu, IndexRange idx_range,
+                            DensityUnitKind du_kind = DensityUnitKind::PROPER) {
   // construct 3d views
-  View<const gr_float***> d(my_fields->density, my_fields->grid_dimension[0],
-                            my_fields->grid_dimension[1],
-                            my_fields->grid_dimension[2]);
-  View<const gr_float***> e(
+  FortranView<const gr_float***> d(
+      my_fields->density, my_fields->grid_dimension[0],
+      my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
+  FortranView<const gr_float***> e(
       my_fields->internal_energy, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  View<const gr_float***> metal(
+  FortranView<const gr_float***> metal(
       my_fields->metal_density, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-
-  // get the appropriate constant
-  const double dom = internalu_calc_dom_(internalu);
-  const double zr = 1. / (internalu.a_value * internalu.a_units) - 1.;
 
   // If no chemistry, use a tabulated mean molecular weight
   // and iterate to convergence.
 
   if (my_chemistry->primordial_chemistry == 0) {
-    if (imetal == 1) {
+    if (my_chemistry->metal_cooling == 1) {
       for (int i = idx_range.i_start; i <= idx_range.i_end; i++) {
         if (itmask[i] != MASK_FALSE) {
           rhoH[i] = my_chemistry->HydrogenFractionByMass *
@@ -170,49 +174,59 @@ inline void basic_gas_props(double* tgas, double* mmw, double* rhoH, int imetal,
         }
       }
     }
+    const double zr = 1. / (internalu.a_value * internalu.a_units) - 1.;
 
-    grackle::impl::calc_temp1d_cloudy(rhoH, tgas, mmw, dom, zr, imetal, itmask,
-                                      my_chemistry, *primordial_cloudy_data,
-                                      my_fields, internalu, idx_range);
+    // if we are concerned about the overhead of checking du_kind, we could
+    // convert it to a template parameter
+    const double dom = internalu_calc_dom_(internalu);
+    const double nHcgs_div_rhoH = (du_kind == DensityUnitKind::PROPER)
+                                      ? dom
+                                      : dom * std::pow(internalu.a_value, -3);
+
+    GRIMPL_NS::calc_temp1d_cloudy(rhoH, tgas, mmw, nHcgs_div_rhoH, zr, itmask,
+                                  my_chemistry, *primordial_cloudy_data,
+                                  my_fields, internalu, idx_range);
 
   } else {
     // get 3D views
-    View<const gr_float***> de(
+    FortranView<const gr_float***> de(
         my_fields->e_density, my_fields->grid_dimension[0],
         my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-    View<const gr_float***> HI(
+    FortranView<const gr_float***> HI(
         my_fields->HI_density, my_fields->grid_dimension[0],
         my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-    View<const gr_float***> HII(
+    FortranView<const gr_float***> HII(
         my_fields->HII_density, my_fields->grid_dimension[0],
         my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-    View<const gr_float***> HeI(
+    FortranView<const gr_float***> HeI(
         my_fields->HeI_density, my_fields->grid_dimension[0],
         my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-    View<const gr_float***> HeII(
+    FortranView<const gr_float***> HeII(
         my_fields->HeII_density, my_fields->grid_dimension[0],
         my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-    View<const gr_float***> HeIII(
+    FortranView<const gr_float***> HeIII(
         my_fields->HeIII_density, my_fields->grid_dimension[0],
         my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-    View<const gr_float***> HM(
+    FortranView<const gr_float***> HM(
         my_fields->HM_density, my_fields->grid_dimension[0],
         my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-    View<const gr_float***> H2I(
+    FortranView<const gr_float***> H2I(
         my_fields->H2I_density, my_fields->grid_dimension[0],
         my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-    View<const gr_float***> H2II(
+    FortranView<const gr_float***> H2II(
         my_fields->H2II_density, my_fields->grid_dimension[0],
         my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
 
     // Compute mean molecular weight (and temperature) directly
 
+    // enforce our assumption about the mass_factor for H and e
+    static_assert(mass_factor::H == 1.0 && mass_factor::e == 1.0);
     for (int i = idx_range.i_start; i <= idx_range.i_end; i++) {
       if (itmask[i] != MASK_FALSE) {
         mmw[i] = (HeI(i, idx_range.j, idx_range.k) +
                   HeII(i, idx_range.j, idx_range.k) +
                   HeIII(i, idx_range.j, idx_range.k)) /
-                     4. +
+                     mass_factor::He +
                  HI(i, idx_range.j, idx_range.k) +
                  HII(i, idx_range.j, idx_range.k) +
                  de(i, idx_range.j, idx_range.k);
@@ -229,7 +243,7 @@ inline void basic_gas_props(double* tgas, double* mmw, double* rhoH, int imetal,
           mmw[i] = mmw[i] + HM(i, idx_range.j, idx_range.k) +
                    (H2I(i, idx_range.j, idx_range.k) +
                     H2II(i, idx_range.j, idx_range.k)) /
-                       2.;
+                       mass_factor::H2;
           rhoH[i] = rhoH[i] + H2I(i, idx_range.j, idx_range.k) +
                     H2II(i, idx_range.j, idx_range.k);
         }
@@ -238,7 +252,7 @@ inline void basic_gas_props(double* tgas, double* mmw, double* rhoH, int imetal,
 
     // Include metal species
 
-    if (imetal == 1) {
+    if (my_chemistry->metal_cooling == 1) {
       for (int i = idx_range.i_start; i <= idx_range.i_end; i++) {
         if (itmask[i] != MASK_FALSE) {
           mmw[i] = mmw[i] + metal(i, idx_range.j, idx_range.k) / MU_METAL;
@@ -322,7 +336,6 @@ inline void basic_gas_props(double* tgas, double* mmw, double* rhoH, int imetal,
 /// @param[out] nelec_times_mH 1D array to hold the number density of electrons
 ///     (multiplied by the Hydrogen mass) for the @p idx_range
 /// @param[in] idx_range Specifies the current index-range
-/// @param[in] imetal Indicates whether metals are evolved
 /// @param[in] itmask Specifies the general iteration-mask of the @p idx_range
 ///     for this calculation.
 /// @param[in] mmw 1D array of mean molecular weights for the @p idx_range
@@ -330,17 +343,17 @@ inline void basic_gas_props(double* tgas, double* mmw, double* rhoH, int imetal,
 /// @param[in] my_fields Specifies the field data.
 inline void calc_metallicity_and_electron_density(
     double* metallicity, double* nelec_times_mH, IndexRange idx_range,
-    int imetal, const gr_mask_type* itmask, const double* mmw,
+    const gr_mask_type* itmask, const double* mmw,
     const chemistry_data* my_chemistry, const grackle_field_data* my_fields) {
-  View<const gr_float***> d(my_fields->density, my_fields->grid_dimension[0],
-                            my_fields->grid_dimension[1],
-                            my_fields->grid_dimension[2]);
-  View<const gr_float***> metal(
+  FortranView<const gr_float***> d(
+      my_fields->density, my_fields->grid_dimension[0],
+      my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
+  FortranView<const gr_float***> metal(
       my_fields->metal_density, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
 
   // calculate metallicity
-  if (imetal == 1) {
+  if (my_chemistry->metal_cooling == 1) {
     for (int i = idx_range.i_start; i <= idx_range.i_end; i++) {
       if (itmask[i] != MASK_FALSE) {
         metallicity[i] = metal(i, idx_range.j, idx_range.k) /
@@ -365,7 +378,7 @@ inline void calc_metallicity_and_electron_density(
         nelec_times_mH[i] =
             1 -
             mmw[i] * (3.0 * my_chemistry->HydrogenFractionByMass + 1.0) / 4.0;
-        if (imetal == 1) {
+        if (my_chemistry->metal_cooling == 1) {
           nelec_times_mH[i] = nelec_times_mH[i] -
                               mmw[i] * metal(i, idx_range.j, idx_range.k) /
                                   (d(i, idx_range.j, idx_range.k) * MU_METAL);
@@ -378,7 +391,7 @@ inline void calc_metallicity_and_electron_density(
   } else {  // my_chemistry->primordial_chemistry > 0
     // directly copy the already known electron density
 
-    View<const gr_float***> de(
+    FortranView<const gr_float***> de(
         my_fields->e_density, my_fields->grid_dimension[0],
         my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
     for (int i = idx_range.i_start; i <= idx_range.i_end; i++) {
@@ -467,7 +480,6 @@ inline void calc_metallicity_and_electron_density(
 ///     are used to hold precomputed values that help linearly interpolate
 ///     tables with respect to the natural log of @p tgas. The strategy for
 ///     filling these buffers depends on the value passed to @p lnT_preparer
-/// @param[in] imetal Indicates whether metals are evolved
 /// @param[in] itmask Specifies the general iteration-mask of the @p idx_range
 ///     for this calculation.
 /// @param[in] my_chemistry holds a number of configuration parameters.
@@ -482,18 +494,17 @@ inline void calc_metallicity_and_electron_density(
 ///     uses undamped values
 inline void extended_gas_props(double* tgas, double* mmw, double* rhoH,
                                double* metallicity, double* nelec_times_mH,
-                               LnTLinInterpBuf& lnT_lininterp_buf, int imetal,
+                               LnTLinInterpBuf& lnT_lininterp_buf,
                                const gr_mask_type* itmask,
                                const chemistry_data* my_chemistry,
                                const cloudy_data* primordial_cloudy_data,
                                const grackle_field_data* my_fields,
                                InternalGrUnits internalu, IndexRange idx_range,
                                const LnTPreparer* lnT_preparer) {
-  basic_gas_props(tgas, mmw, rhoH, imetal, itmask, my_chemistry,
-                  primordial_cloudy_data, my_fields, internalu, idx_range);
+  basic_gas_props(tgas, mmw, rhoH, itmask, my_chemistry, primordial_cloudy_data,
+                  my_fields, internalu, idx_range);
   calc_metallicity_and_electron_density(metallicity, nelec_times_mH, idx_range,
-                                        imetal, itmask, mmw, my_chemistry,
-                                        my_fields);
+                                        itmask, mmw, my_chemistry, my_fields);
 
   // technically, we could skip the filling of lnT_lininterp_bufs if
   // primordial_chemistry == 0 AND dust_chemistry == 0.

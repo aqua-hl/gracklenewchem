@@ -17,6 +17,7 @@
 
 #include "cool1d_multi_g.hpp"
 #include "cool_multi_time.hpp"
+#include "field_adaptor.hpp"
 #include "gas_props.hpp"
 #include "grackle.h"
 #include "support/index_helper.hpp"
@@ -24,6 +25,7 @@
 #include "internal_units.hpp"
 #include "internal_types.hpp"
 #include "lnT_prep.hpp"
+#include "mask.hpp"
 #include "scale_fields.hpp"
 #include "support/config.hpp"
 #include "utils-cpp.hpp"
@@ -31,7 +33,7 @@
 namespace GRIMPL_NAMESPACE_DECL {
 
 void cool_multi_time(
-  gr_float* cooltime_data_, int imetal, InternalGrUnits internalu,
+  gr_float* cooltime_data_, InternalGrUnits internalu,
   chemistry_data* my_chemistry, chemistry_data_storage* my_rates,
   grackle_field_data* my_fields, photo_rate_storage my_uvb_rates
 )
@@ -42,7 +44,7 @@ void cool_multi_time(
   if (internalu.extfields_in_comoving == 1)  {
     gr_float factor = (gr_float)(std::pow(internalu.a_value,(-3)) );
     scale_fields(
-        imetal, factor, my_chemistry, my_fields,
+        factor, my_chemistry, my_fields,
         get_n_inject_pathway_density_ptrs(my_rates));
   }
 
@@ -52,16 +54,15 @@ void cool_multi_time(
     // each OMP thread separately initializes/allocates variables defined in
     // the current scope and then enters the for-loop
 
-    View<gr_float***> cooltime(cooltime_data_, my_fields->grid_dimension[0], my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
+    FieldAdaptorManager field_adaptor_mgr(my_fields);
+
+    FortranView<gr_float***> cooltime(cooltime_data_, my_fields->grid_dimension[0], my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
 
     GrainSpeciesCollection grain_temperatures =
       new_GrainSpeciesCollection(my_fields->grid_dimension[0]);
 
     LnTLinInterpBuf logTlininterp_buf =
       new_LnTLinInterpBuf(my_fields->grid_dimension[0]);
-
-    Cool1DMultiScratchBuf cool1dmulti_buf =
-      new_Cool1DMultiScratchBuf(my_fields->grid_dimension[0]);
  
     CoolHeatScratchBuf coolingheating_buf =
       new_CoolHeatScratchBuf(my_fields->grid_dimension[0]);
@@ -79,17 +80,18 @@ void cool_multi_time(
     std::vector<double> rhoH(my_fields->grid_dimension[0]);
     std::vector<double> nelec_times_mH(my_fields->grid_dimension[0]);
     std::vector<double> edot(my_fields->grid_dimension[0]);
+    std::vector<double> alpha_continuum(my_fields->grid_dimension[0]);
 
     // Iteration mask for multi_cool
     std::vector<gr_mask_type> itmask(my_fields->grid_dimension[0]);
     std::vector<gr_mask_type> itmask_metal(my_fields->grid_dimension[0]);
 
     // create views of density and internal energy fields to support 3D access
-    grackle::impl::View<gr_float***> d(my_fields->density,
+    FortranView<gr_float***> d(my_fields->density,
                                        my_fields->grid_dimension[0],
                                        my_fields->grid_dimension[1],
                                        my_fields->grid_dimension[2]);
-    grackle::impl::View<gr_float***> specific_eint(
+    FortranView<gr_float***> specific_eint(
         my_fields->internal_energy, my_fields->grid_dimension[0],
         my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
 
@@ -104,6 +106,9 @@ void cool_multi_time(
       const int k = idx_range.k; // use 0-based index
       const int j = idx_range.j; // use 0-based index
 
+      SpeciesMultiView<const gr_float> species_densities
+          = field_adaptor_mgr.get_species_data(idx_range);
+
       for (int i = idx_range.i_start; i < idx_range.i_stop; i++) {
         itmask[i] = MASK_TRUE;
       }
@@ -112,20 +117,46 @@ void cool_multi_time(
       // and fill up logTlinterp_buf
       extended_gas_props(tgas.data(), mmw.data(), rhoH.data(),
                          metallicity.data(), nelec_times_mH.data(),
-                         logTlininterp_buf, imetal, itmask.data(),
+                         logTlininterp_buf, itmask.data(),
                          my_chemistry, &my_rates->cloudy_primordial,
                          my_fields, internalu, idx_range, nullptr);
 
+      // Adjust itmask based on Tfloor and fill itmask_metal
+      mask::adjust_from_Tfloor(itmask.data(), tgas.data(), idx_range,
+                               my_chemistry, my_fields);
+      mask::fill_itmask_metal(itmask_metal.data(), itmask.data(),
+                              metallicity.data(), idx_range,
+                              my_chemistry);
+
+      // Initialize edot (and alpha_continuum)
+      // -> we're setting edot to tiny_fortran_val to avoid a divide-by-zero
+      //    when Tfloor is relevant. The more robust solution is explicitly
+      //    avoid dividing by zero when computing cooltime
+      for (int i = idx_range.i_start; i < idx_range.i_stop; i++) {
+        edot[i] = (itmask[i] == MASK_FALSE) ? tiny_fortran_val : 0.0;
+        alpha_continuum[i] = 0.0;  // <- this is redundant (its already 0)
+      }
+
+      // now, handle specifics of our dust model. This includes:
+      // - computing Tdust (tdust or grain_temperatures may be filled)
+      // - computing dust2gas (for some dust models)
+      // - add contributions to alpha_continuum (for some dust models)
+      // - add contributions to edot from dust
+      // (we skip calculation of reaction rates)
+      my_rates->opaque_storage->dust_solver.calc_Tdust_and_chem_contrib(
+          edot.data(), alpha_continuum.data(), nullptr, dust2gas.data(),
+          tdust.data(), grain_temperatures, tgas.data(), rhoH.data(),
+          nelec_times_mH.data(), metallicity.data(), itmask.data(),
+          itmask_metal.data(), my_chemistry, my_rates, my_fields,
+          species_densities, internalu, idx_range, logTlininterp_buf);
+
       // compute edot
       cool1d_multi_g(
-        imetal, edot.data(), tgas.data(),
-        mmw.data(), tdust.data(), metallicity.data(),
-        dust2gas.data(), rhoH.data(), nelec_times_mH.data(), 
-        itmask.data(), itmask_metal.data(),
-        my_chemistry, my_rates, my_fields, my_uvb_rates, internalu, idx_range,
-        grain_temperatures, logTlininterp_buf, cool1dmulti_buf,
-        coolingheating_buf
-      );
+          edot.data(), alpha_continuum.data(), tgas.data(), mmw.data(),
+          metallicity.data(), rhoH.data(), nelec_times_mH.data(), itmask.data(),
+          itmask_metal.data(), my_chemistry, my_rates, my_fields,
+          species_densities, my_uvb_rates, internalu, idx_range,
+          logTlininterp_buf, coolingheating_buf);
 
       // Compute the cooling time on the slice
       //   (the gamma used here is the same as used to calculate the pressure
@@ -146,8 +177,7 @@ void cool_multi_time(
     // cleanup temporaries
     drop_GrainSpeciesCollection(&grain_temperatures);
     drop_LnTLinInterpBuf(&logTlininterp_buf);
-    drop_Cool1DMultiScratchBuf(&cool1dmulti_buf);
-    impl::drop_CoolHeatScratchBuf(&coolingheating_buf);
+    drop_CoolHeatScratchBuf(&coolingheating_buf);
 
   }  // OMP_PRAGMA("omp parallel")
 
@@ -155,7 +185,7 @@ void cool_multi_time(
   if (internalu.extfields_in_comoving == 1)  {
     gr_float factor = (gr_float)(std::pow(internalu.a_value,3) );
     scale_fields(
-        imetal, factor, my_chemistry, my_fields,
+        factor, my_chemistry, my_fields,
         get_n_inject_pathway_density_ptrs(my_rates));
   }
 

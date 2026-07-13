@@ -1,39 +1,45 @@
-// See LICENSE file for license and copyright information
-
-/// @file time_deriv_0d.hpp
-/// @brief Defines machinery to calculate the time derivative for a single zone
+//===----------------------------------------------------------------------===//
+//
+// See the LICENSE file for license and copyright information
+// SPDX-License-Identifier: NCSA AND BSD-3-Clause
+//
+//===----------------------------------------------------------------------===//
+///
+/// @file
+/// Defines machinery to calculate the time derivative for a single zone
+///
+//===----------------------------------------------------------------------===//
 
 #ifndef TIME_DERIV_0D_HPP
 #define TIME_DERIV_0D_HPP
 
+#include "LUT.hpp"
 #include "cool1d_multi_g.hpp"
 #include "chemistry_solver_funcs.hpp"
-#include "dust_props.hpp"
-#include "gas_props.hpp"
-#include "fortran_func_wrappers.hpp"
+#include "dust/multi_grain_species/dust_props.hpp"
+#include "field_adaptor.hpp"
 #include "full_rxn_rate_buf.hpp"
+#include "gas_props.hpp"
 #include "grackle.h"
-#include "grackle_macros.h" // GRACKLE_FREE
-#include "support/index_helper.hpp"
 #include "internal_types.hpp"
 #include "lnT_prep.hpp"
+#include "mask.hpp"
 #include "rate_timestep_g.hpp"
 #include "lookup_cool_rates1d.hpp"
-#include "utils-field.hpp"
+#include "support/config.hpp"
+#include "support/index_helper.hpp"
 
 // we choose to adopt a longer, more descriptive namespace here so that the
 // handful of functions defined in this file can have shorter names (in the
 // future, if we are willing to define methods on a struct, we can definitely
 // shorten the namespace name)
-namespace grackle::impl::time_deriv_0d {
+namespace GRIMPL_NAMESPACE_DECL {
+namespace time_deriv_0d {
 
 /// this is a collection of the arguments that won't change between successive
 /// time derivative calculations
 struct FrozenSimpleArgs {
   // the following batch of args are all forwarded
-  int imetal;
-  // todo: we can delete `iter`. This is only here for historical reasons
-  int iter;
   double dom;
   double chunit;
   double dx_cgs;
@@ -56,7 +62,6 @@ struct FrozenSimpleArgs {
 struct MainScratchBuf {
   GrainSpeciesCollection grain_temperatures;
   LnTLinInterpBuf logTlininterp_buf;
-  Cool1DMultiScratchBuf cool1dmulti_buf;
   CoolHeatScratchBuf coolingheating_buf;
   ChemHeatingRates chemheatrates_buf;
   InternalDustPropBuf internal_dust_prop_scratch_buf;
@@ -69,12 +74,11 @@ struct MainScratchBuf {
 
 /// @param[in] opacity_table_size The number of elements in a dynamically
 ///    computed dust grain opacity table
-MainScratchBuf new_MainScratchBuf(int grain_opacity_table_size) {
+inline MainScratchBuf new_MainScratchBuf(int grain_opacity_table_size) {
   int nelem = 1;
   MainScratchBuf out;
   out.grain_temperatures = new_GrainSpeciesCollection(nelem);
   out.logTlininterp_buf = new_LnTLinInterpBuf(nelem);
-  out.cool1dmulti_buf = new_Cool1DMultiScratchBuf(nelem);
   out.coolingheating_buf = new_CoolHeatScratchBuf(nelem);
   out.chemheatrates_buf = new_ChemHeatingRates(nelem);
   out.internal_dust_prop_scratch_buf =
@@ -85,10 +89,9 @@ MainScratchBuf new_MainScratchBuf(int grain_opacity_table_size) {
   return out;
 }
 
-void drop_MainScratchBuf(MainScratchBuf* ptr) {
+inline void drop_MainScratchBuf(MainScratchBuf* ptr) {
   drop_GrainSpeciesCollection(&ptr->grain_temperatures);
   drop_LnTLinInterpBuf(&ptr->logTlininterp_buf);
-  drop_Cool1DMultiScratchBuf(&ptr->cool1dmulti_buf);
   drop_CoolHeatScratchBuf(&ptr->coolingheating_buf);
   drop_ChemHeatingRates(&ptr->chemheatrates_buf);
   drop_InternalDustPropBuf(&ptr->internal_dust_prop_scratch_buf);
@@ -139,9 +142,8 @@ struct Assorted1ElemBuf {
 struct ContextPack {
   /// holds the local value of itmask_metal
   gr_mask_type local_itmask_metal;
-  /// specifies how we handling edot in the calculation. This comes from
-  /// an array historically known as imp_eng
-  int local_edot_handling;
+  /// specifies whether we should compute edot
+  bool calculate_edot;
 
   /// this represents the precomputed index-range
   /// - if we transition to an implementation where we compute the time
@@ -160,6 +162,26 @@ struct ContextPack {
   int grid_start[3];
   int grid_end[3];
   /** @} */
+
+  /// @defgroup dynamic_field_bufs
+  /// The arrays in this group provide storage for the various 1-element buffers
+  /// used with the dynamically evolved `fields`
+  /** @{ */
+  gr_float eint_field_buf[1];
+  gr_float sp_density_buf[MAX_EVOLVED_SPECIES_FIELDS];
+  /** @} */
+
+  /// @brief tracks the machinery for creating a @ref SpeciesMultiView instance
+  ///
+  /// This is the most effective way to keep the @ref SpeciesMultiView
+  /// instances synchronized with the pointers in @ref fields data-member.
+  ///
+  /// @note
+  /// The goal is to eventually access field-data through @ref SpeciesMultiView
+  /// (and other analogues) so that we can stop passing around
+  /// grackle_field_data pointers. At that point we will be able to remove this
+  /// data member.
+  FieldAdaptorManager field_adaptor_mgr;
 
   /// @defgroup general_time_deriv_packs
   /// The members in this group store packs of data that are used within the
@@ -235,20 +257,27 @@ inline ContextPack new_ContextPack(
 /// @param[in] field_idx1d the index where we will be performing the calculation
 ///    (it has already been remapped from multiple dimensions to 1D).
 /// @param[in] local_itmask_metal specifies the local values of itmask_metal
-/// @param[in] local_edot_handling Specifies how we handle energy evolution.
-///    This is read from an array historically known as `imp_eng`
+/// @param[in] calculate_edot Indicates whether to compute edot
 inline void configure_ContextPack(
   ContextPack* pack, const grackle_field_data* my_fields,
-  int field_idx1d, gr_mask_type local_itmask_metal, int local_edot_handling
+  int field_idx1d, gr_mask_type local_itmask_metal, bool calculate_edot
 ) {
   pack->local_itmask_metal = local_itmask_metal;
-  pack->local_edot_handling = local_edot_handling;
+  pack->calculate_edot = calculate_edot;
   pack->fields.grid_dx = my_fields->grid_dx;
 
-  // here, we overwrite each field in pack.fields_1zone with pointers from
-  // each field in my_fields corresponding to the current location (i,j,k)
+  // here, we overwrite each field in pack.fields with pointers from each field
+  // in my_fields corresponding to the current location (i,j,k)
   copy_offset_fieldmember_ptrs_(&pack->fields, my_fields, field_idx1d);
+  // now we overwrite each field corresponding to a dynamically evolved quantity
+  // to point to a pre-allocated quantity
+  copy_contigSpTable_fieldmember_ptrs_(&pack->fields, pack->sp_density_buf, 1);
+  pack->fields.internal_energy = pack->eint_field_buf;
 
+  // let's overwrite the pointer wrapped by FieldAdaptorManager
+  // -> it's safe to use this here since we make sure that we never retain
+  //    view-like objects constructed from field_adaptor_mgr before this call
+  pack->field_adaptor_mgr.unsafe_reset_wrapped_ptr(&pack->fields);
 }
 
 /// here we copy the values from the scratch buffers (used by grackle's main
@@ -272,7 +301,6 @@ inline void scratchbufs_copy_into_pack(
   const double* rhoH, const double* mmw, const double* nelec_times_mH,
   const double* edot, grackle::impl::GrainSpeciesCollection grain_temperatures,
   grackle::impl::LnTLinInterpBuf logTlininterp_buf,
-  grackle::impl::Cool1DMultiScratchBuf cool1dmulti_buf,
   grackle::impl::CoolHeatScratchBuf coolingheating_buf,
   grackle::impl::ChemHeatingRates chemheatrates_buf
 ) {
@@ -306,12 +334,6 @@ inline void scratchbufs_copy_into_pack(
       pack->main_scratch_buf.grain_temperatures, grain_temperatures, copy_fn
     );
 
-    // the tgasold buffer is definitely needed when the current implementation
-    // co-evolves the internal energy
-    visit_member_pair(
-      pack->main_scratch_buf.cool1dmulti_buf, cool1dmulti_buf, copy_fn
-    );
-
     // unclear whether the following cases need to be copied
     visit_member_pair(
       pack->main_scratch_buf.coolingheating_buf, coolingheating_buf, copy_fn
@@ -336,68 +358,8 @@ inline void scratchbufs_copy_into_pack(
   pack->other_scratch_buf.edot[0] = edot[index];
 }
 
-/// here we copy the values into the scratch buffers (used by grackle's main
-/// loop) at a single index from the corresponding buffers tracked by the
-/// ContextPack.
-///
-/// @note
-/// This function should **NOT** exist and should be removed (it only exists
-/// right now as we pursue transcription). In particular, it makes no logical
-/// sense to overwrite the value of cool1dmulti_buf.tgasold
-inline void scratchbufs_copy_from_pack(
-  int index, ContextPack* pack, double* tgas,
-  double* tdust, double* metallicity, double* dust2gas, double* rhoH,
-  double* mmw, double* nelec_times_mH, double* edot,
-  grackle::impl::GrainSpeciesCollection grain_temperatures,
-  grackle::impl::LnTLinInterpBuf logTlininterp_buf,
-  grackle::impl::Cool1DMultiScratchBuf cool1dmulti_buf,
-  grackle::impl::CoolHeatScratchBuf coolingheating_buf,
-  grackle::impl::ChemHeatingRates chemheatrates_buf
-) {
-
-  // first, we copy the values from the buffers of pack->main_scratch_buf
-  {
-    // to help out, we define a lambda function (it captures index by value)
-    auto copy_fn = [index](
-      const char* name, auto*& pack_buf, auto*& external_buf,
-      const grackle::impl::visitor::BufLenSpec& spec
-    ) { external_buf[index] = pack_buf[0]; };
-
-    visit_member_pair(
-      pack->main_scratch_buf.logTlininterp_buf, logTlininterp_buf, copy_fn
-    );
-    visit_member_pair(
-      pack->main_scratch_buf.grain_temperatures, grain_temperatures, copy_fn
-    );
-    visit_member_pair(
-      pack->main_scratch_buf.cool1dmulti_buf, cool1dmulti_buf, copy_fn
-    );
-    visit_member_pair(
-      pack->main_scratch_buf.coolingheating_buf, coolingheating_buf, copy_fn
-    );
-    visit_member_pair(
-      pack->main_scratch_buf.chemheatrates_buf, chemheatrates_buf, copy_fn
-    );
-  }
-
-  // second, we copy the remaining values
-  tgas[index] = pack->other_scratch_buf.tgas[0];
-  tdust[index] = pack->other_scratch_buf.tdust[0];
-  metallicity[index] = pack->other_scratch_buf.metallicity[0];
-  dust2gas[index] = pack->other_scratch_buf.dust2gas[0];
-  rhoH[index] = pack->other_scratch_buf.rhoH[0];
-  mmw[index] = pack->other_scratch_buf.mmw[0];
-  nelec_times_mH[index] = pack->other_scratch_buf.nelec_times_mH[0];
-  edot[index] = pack->other_scratch_buf.edot[0];
-
-}
-
-
 /// calculate the time derivatives
 ///
-/// @param[in] dt_FIXME Specifies the timestep passed to the
-///   lookup_cool_rates1d function. See the docstring for that function
-///   for more details (this needs to be revisited)
 /// @param[in] rhosp Specifies the species mass densities to use for computing
 ///   the time derivatives. This always has enough space for each species (it
 ///   is indexed by SpLUT), even if some entries are not evolved.
@@ -424,32 +386,12 @@ inline void scratchbufs_copy_from_pack(
 /// @note
 /// If we ever redefine `SpeciesCollection` to be a class template, it would be
 /// natural to represent `rhosp` with `SpeciesCollection<gr_float>`
-///
-/// @par Future Performance Considerations:
-/// From a performance perspective, a compelling case could be made that we
-/// should be wiring up the members of the `grackle_field_data` struct to point
-/// to the entries of `rhosp` and `eint` ahead of time (before we call this
-/// function). In that scenario, it would probably make the most sense:
-/// - to replace `rhosp` and `eint` arguments with an argument passing the
-///   struct AND to manage the struct entirely outside of the logic in the
-///   time_deriv_0d namespace (this could make a lot of sense if we transition
-///   this function to operating on arrays of inputs)
-/// - Alternatively, we could organize all of the routines in this namespace so
-///   that they represent a single well-defined data-structure with explicitly
-///   documented semantics for the order of invoking commands. Essentially, it
-///   would need to be a state-machine.
-/// - (no matter what, we should try to avoid a bunch of implicit "magic")
-/// In reality, `grackle_field_data` is very poorly suited for its current role
-/// as a universal data-structure for passing around any/all kinds of field
-/// data. And, we should work on coming up with a superior alternative for
-/// use within Grackle
-void derivatives(
-  double dt_FIXME, gr_float* rhosp, grackle::impl::SpeciesCollection rhosp_dot,
-  gr_float* eint, double* eint_dot_specific, ContextPack& pack
+inline void derivatives(
+  const gr_float* rhosp, SpeciesCollection rhosp_dot, const gr_float* eint,
+  double* eint_dot_specific, ContextPack& pack
 ) {
 
   // introduce some namespace abbreviations for use within this function
-  namespace f_wrap = ::grackle::impl::fortran_wrapper;
   namespace gr_chem = ::grackle::impl::chemistry;
 
   chemistry_data* my_chemistry = pack.fwd_args.my_chemistry;
@@ -459,16 +401,27 @@ void derivatives(
 
   pack.other_scratch_buf.itmask[0] = MASK_TRUE;
 
-  // configure the relevant members of `pack.fields` to point to the buffers
-  // specified by the rhosp and eint argument.
-  // -> the "Future Performance Considerations" section of the docstring has
-  //    a relevant discussion about this operation
-  copy_contigSpTable_fieldmember_ptrs_(&pack.fields, rhosp, 1);
-  pack.fields.internal_energy = &eint[0];
+  // copy values in eint & rhosp arguments into buffers tracked by pack.fields
+  pack.eint_field_buf[0] = eint[0];
+  for (int i=0; i < MAX_EVOLVED_SPECIES_FIELDS; i++) {
+    pack.sp_density_buf[i] = rhosp[i];
+  }
 
-  if (pack.local_edot_handling != 1) {
-    // in this branch, we're effectively ignoring the dependence of temperature
-    // on species number density.
+  // construct the view of all dynamically evolved species densities
+  // -> because of our use of FieldAdaptorManager::unsafe_reset_wrapped_ptr,
+  //    it's very important that we do NOT try to retain this data type between
+  //    iterations
+  SpeciesMultiView<const gr_float> sp_densities
+    = pack.field_adaptor_mgr.get_species_data(pack.idx_range_1_element);
+
+  if (!pack.calculate_edot) {
+    // in this branch, we're effectively assuming that the time derivative of
+    // temperature is 0. This assumption derives from the current choice to
+    // assume that the time derivative of specific internal energy is 0 while
+    // evolving chemistry.
+    // 
+    // Note that by assuming dT/dt = 0, we're effectively assuming that
+    // temperature is independent of species number density.
     // -> strictly speaking, this is false since gamma and the mean molecular
     //    weight vary with respect to species densities
 
@@ -477,6 +430,26 @@ void derivatives(
         pack.main_scratch_buf.logTlininterp_buf, pack.idx_range_1_element,
         *my_chemistry, pack.other_scratch_buf.itmask,
         pack.other_scratch_buf.tgas);
+
+    
+    // Lookup rate for H2 formation on dust & (when relevant) grain growth rates
+    // -> these calculations reuse the precomputed dust temperature and (when
+    //    relevant) the precomputed dust2gas buffer
+    // -> strictly speaking, in models where the the dust species densities are
+    //    allowed to vary, it would be more correct to recompute the dust
+    //    temperature (since dust absorption will vary)
+    // -> we don't do that right now for historical consistency and because it
+    //    would probably be computationally demanding
+    if (DustSolver::any_dust_rxn_rates(*my_chemistry)) {
+      my_rates->opaque_storage->dust_solver.lookup_dust_rxn_rates1d(
+          pack.idx_range_1_element, pack.other_scratch_buf.tdust,
+          pack.other_scratch_buf.dust2gas, pack.fwd_args.dom,
+          &pack.local_itmask_metal, my_chemistry, my_rates,
+          &pack.fields, sp_densities, pack.main_scratch_buf.grain_temperatures,
+          pack.main_scratch_buf.logTlininterp_buf,
+          pack.main_scratch_buf.rxn_rate_buf,
+          pack.main_scratch_buf.internal_dust_prop_scratch_buf);
+    }
   } else {
     // compute gas properties (tgas, mmw, rhoH, metallicity, nelec_times_mH)
     // and fill up logTlinterp_buf
@@ -485,7 +458,7 @@ void derivatives(
                        pack.other_scratch_buf.metallicity,
                        pack.other_scratch_buf.nelec_times_mH,
                        pack.main_scratch_buf.logTlininterp_buf,
-                       pack.fwd_args.imetal, pack.other_scratch_buf.itmask,
+                       pack.other_scratch_buf.itmask,
                        my_chemistry, &my_rates->cloudy_primordial, &pack.fields,
                        internalu, pack.idx_range_1_element,
                        // passing nullptr means that values in
@@ -493,39 +466,73 @@ void derivatives(
                        // are filled with the undamped version of the algorithm
                        nullptr);
 
+    // Adjust itmask based on Tfloor and fill itmask_metal
+    // -> TODO: I think we should strongly consider skipping these adjustments
+    //    (if we are near the threshold where the masking is affected, that
+    //    could mess with the numerical partial derivatives)
+    mask::adjust_from_Tfloor(pack.other_scratch_buf.itmask,
+                             pack.other_scratch_buf.tgas,
+                             pack.idx_range_1_element, my_chemistry,
+                             &pack.fields);
+    mask::fill_itmask_metal(&pack.local_itmask_metal,
+                            pack.other_scratch_buf.itmask,
+                            pack.other_scratch_buf.metallicity,
+                            pack.idx_range_1_element,
+                            my_chemistry);
+
+    // initialize the edot buffer
+    // -> setting edot to tiny_fortran_val is purely for historical consistency
+    // -> I don't think setting it to 0 will cause any problems
+    pack.other_scratch_buf.edot[0] =
+        (pack.other_scratch_buf.itmask[0] == MASK_FALSE) ? tiny_fortran_val : 0.0;
+
+    double alpha_continuum[1] = {0.0};
+
+
+    // the next function call:
+    // - compute Tdust (tdust or grain_temperatures may be filled)
+    // - compute dust2gas (depending on dust model)
+    // - add contributions to alpha_continuum (depends on dust model)
+    // - add contributions to edot from dust
+    // - compute and store dust-related reaction rates in rxn_rate_buf
+    my_rates->opaque_storage->dust_solver.calc_Tdust_and_chem_contrib(
+        pack.other_scratch_buf.edot, alpha_continuum,
+        &pack.main_scratch_buf.rxn_rate_buf, pack.other_scratch_buf.dust2gas,
+        pack.other_scratch_buf.tdust, pack.main_scratch_buf.grain_temperatures,
+        pack.other_scratch_buf.tgas, pack.other_scratch_buf.rhoH,
+        pack.other_scratch_buf.nelec_times_mH,
+        pack.other_scratch_buf.metallicity, pack.other_scratch_buf.itmask,
+        &pack.local_itmask_metal, my_chemistry, my_rates, &pack.fields,
+        sp_densities, internalu, pack.idx_range_1_element,
+        pack.main_scratch_buf.logTlininterp_buf);
+
     // Compute the edot values (so we can get the cooling time)
-    // -> at this time the function also fillls dust2gas and tdust. It can
-    //    also modify itmask and itmask_metal
+    // -> at this time the function also fillls dust2gas and tdust
     // -> (we plan to factor out the extra calculations)
     cool1d_multi_g(
-      pack.fwd_args.imetal,
-      pack.other_scratch_buf.edot, pack.other_scratch_buf.tgas,
-      pack.other_scratch_buf.mmw,
-      pack.other_scratch_buf.tdust, pack.other_scratch_buf.metallicity,
-      pack.other_scratch_buf.dust2gas, pack.other_scratch_buf.rhoH,
+      pack.other_scratch_buf.edot, alpha_continuum,
+      pack.other_scratch_buf.tgas, pack.other_scratch_buf.mmw,
+      pack.other_scratch_buf.metallicity, pack.other_scratch_buf.rhoH,
       pack.other_scratch_buf.nelec_times_mH,
       pack.other_scratch_buf.itmask, &pack.local_itmask_metal, my_chemistry, my_rates, &pack.fields,
-      my_uvb_rates, internalu, pack.idx_range_1_element, pack.main_scratch_buf.grain_temperatures,
+      sp_densities,
+      my_uvb_rates, internalu, pack.idx_range_1_element,
       pack.main_scratch_buf.logTlininterp_buf,
-      pack.main_scratch_buf.cool1dmulti_buf,
       pack.main_scratch_buf.coolingheating_buf
     );
   }
 
   // uses the temperature to look up the chemical rates (they are interpolated
   // with respect to log temperature from input tables)
-  grackle::impl::lookup_cool_rates1d(
-    pack.idx_range_1_element, pack.fwd_args.anydust,
+  GRIMPL_NS::lookup_cool_rates1d(
+    pack.idx_range_1_element,
     pack.other_scratch_buf.tgas, pack.other_scratch_buf.mmw,
-    pack.other_scratch_buf.tdust, pack.other_scratch_buf.dust2gas,
     pack.fwd_args.dom, pack.fwd_args.dx_cgs, pack.fwd_args.c_ljeans,
-    pack.other_scratch_buf.itmask, &pack.local_itmask_metal, dt_FIXME,
-    my_chemistry, my_rates, &pack.fields, my_uvb_rates, internalu,
-    pack.main_scratch_buf.grain_temperatures,
+    pack.other_scratch_buf.itmask, &pack.local_itmask_metal,
+    my_chemistry, my_rates, &pack.fields, sp_densities, my_uvb_rates, internalu,
     pack.main_scratch_buf.logTlininterp_buf,
     pack.main_scratch_buf.rxn_rate_buf,
-    pack.main_scratch_buf.chemheatrates_buf,
-    pack.main_scratch_buf.internal_dust_prop_scratch_buf
+    pack.main_scratch_buf.chemheatrates_buf
   );
 
 
@@ -534,7 +541,7 @@ void derivatives(
   // -> we don't care about these quantities (we recompute them later)
   // -> I'm pretty sure we care about how the following function also modifies
   //    edot
-  if (pack.local_edot_handling == 1)  {
+  if (pack.calculate_edot)  {
 
     grackle::impl::rate_timestep_g(
       pack.other_scratch_buf.dedot, pack.other_scratch_buf.HIdot,
@@ -553,22 +560,24 @@ void derivatives(
     pack.other_scratch_buf.edot[0] / pack.fields.density[0]
   );
 
+
+  View<gr_float**> rhosp_dot_view(rhosp_dot.data[0],
+                                  MAX_EVOLVED_SPECIES_FIELDS, 1);
+
   // Initialize entries of the derivatives buffer to 0
-  // -> we could define a function associated with SpeciesCollection to perform
-  //    a much more optimized version of this operation by taking advantage of
-  //    the underlying implementation
-  for (int sp_idx = 0; sp_idx < SpLUT::NUM_ENTRIES; sp_idx++) {
-    rhosp_dot.data[sp_idx][0] = 0.0;
+  for (int sp_idx = 0; sp_idx < MAX_EVOLVED_SPECIES_FIELDS; sp_idx++) {
+    rhosp_dot_view(sp_idx,0) = 0.0;
   }
 
   gr_chem::species_density_derivatives_0d(
-    rhosp_dot, pack.fwd_args.anydust, pack.other_scratch_buf.rhoH,
+    rhosp_dot_view, pack.fwd_args.anydust, pack.other_scratch_buf.rhoH,
     &pack.local_itmask_metal, my_chemistry, &pack.fields,
     pack.main_scratch_buf.rxn_rate_buf
   );
 }
 
 
-} // namespace grackle::impl::time_deriv_0d
+} // namespace time_deriv_0d
+} // namespace GRIMPL_NAMESPACE_DECL
 
 #endif /* TIME_DERIV_0D_HPP */

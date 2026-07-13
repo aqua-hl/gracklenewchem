@@ -77,9 +77,9 @@ double abundance_ratio(double solar_eps, double local_eps) {
 struct HNucleiCensus {
   bool use_H, use_H2, use_HD, use_HeH, use_metal_H;
   double hfrac;
-  grackle::impl::View<gr_float***> d, metal;
-  grackle::impl::View<gr_float***> HI, HII, HM, H2I, H2II, HDI, HDII, HeHII;
-  grackle::impl::View<gr_float***> OH, H2O, CH, CH2, OHII, H2OII, H3OII;
+  grackle::impl::FortranView<gr_float***> d, metal;
+  grackle::impl::FortranView<gr_float***> HI, HII, HM, H2I, H2II, HDI, HDII, HeHII;
+  grackle::impl::FortranView<gr_float***> OH, H2O, CH, CH2, OHII, H2OII, H3OII;
 
   HNucleiCensus(const chemistry_data* my_chemistry,
                 const grackle_field_data* my_fields)
@@ -99,10 +99,10 @@ struct HNucleiCensus {
         HDI(view_(my_fields, my_fields->HDI_density, use_HD)),
         HDII(view_(my_fields, my_fields->HDII_density, use_HeH)),
         HeHII(view_(my_fields, my_fields->HeHII_density, use_HeH)),
-        OH(view_(my_fields, my_fields->OH_density, use_metal_H)),
-        H2O(view_(my_fields, my_fields->H2O_density, use_metal_H)),
-        CH(view_(my_fields, my_fields->CH_density, use_metal_H)),
-        CH2(view_(my_fields, my_fields->CH2_density, use_metal_H)),
+        OH(view_(my_fields, my_fields->OHI_density, use_metal_H)),
+        H2O(view_(my_fields, my_fields->H2OI_density, use_metal_H)),
+        CH(view_(my_fields, my_fields->CHI_density, use_metal_H)),
+        CH2(view_(my_fields, my_fields->CH2I_density, use_metal_H)),
         OHII(view_(my_fields, my_fields->OHII_density, use_metal_H)),
         H2OII(view_(my_fields, my_fields->H2OII_density, use_metal_H)),
         H3OII(view_(my_fields, my_fields->H3OII_density, use_metal_H)) {}
@@ -132,9 +132,9 @@ struct HNucleiCensus {
   }
 
  private:
-  static grackle::impl::View<gr_float***> view_(
+  static grackle::impl::FortranView<gr_float***> view_(
       const grackle_field_data* my_fields, gr_float* ptr, bool active) {
-    return grackle::impl::View<gr_float***>(
+    return grackle::impl::FortranView<gr_float***>(
         active ? ptr : my_fields->density, my_fields->grid_dimension[0],
         my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
   }
@@ -151,13 +151,13 @@ void grackle::impl::dust_growth(chemistry_data* my_chemistry,
                                 const gr_mask_type* itmask,
                                 const double* dt_value, const double* t_gas,
                                 double* growth_dM) {
-  grackle::impl::View<gr_float***> d(
+  grackle::impl::FortranView<gr_float***> d(
       my_fields->density, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> dust(
+  grackle::impl::FortranView<gr_float***> dust(
       my_fields->dust_density, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> metal(
+  grackle::impl::FortranView<gr_float***> metal(
       my_fields->metal_density, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
 
@@ -222,31 +222,31 @@ void grackle::impl::dust_growth_species(
     double* growth_dM_mg_silicate, double* growth_dM_fe_silicate,
     double* growth_dM_carbon) {
 
-  grackle::impl::View<gr_float***> d(
+  grackle::impl::FortranView<gr_float***> d(
       my_fields->density, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> dust_mg_sil(
+  grackle::impl::FortranView<gr_float***> dust_mg_sil(
       my_fields->dust_density_mg_silicate, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> dust_fe_sil(
+  grackle::impl::FortranView<gr_float***> dust_fe_sil(
       my_fields->dust_density_fe_silicate, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> dust_carb(
+  grackle::impl::FortranView<gr_float***> dust_carb(
       my_fields->dust_density_carbonaceous, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> mC(
+  grackle::impl::FortranView<gr_float***> mC(
       my_fields->metal_density_carbon, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> mO(
+  grackle::impl::FortranView<gr_float***> mO(
       my_fields->metal_density_oxygen, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> mMg(
+  grackle::impl::FortranView<gr_float***> mMg(
       my_fields->metal_density_magnesium, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> mSi(
+  grackle::impl::FortranView<gr_float***> mSi(
       my_fields->metal_density_silicon, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> mFe(
+  grackle::impl::FortranView<gr_float***> mFe(
       my_fields->metal_density_iron, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
   HNucleiCensus h_census(my_chemistry, my_fields);
@@ -330,7 +330,7 @@ void grackle::impl::dust_growth_species(
       if (rho_gas <= 0.0 || rho_H_nuclei <= 0.0) {
         continue;
       }
-      double nH = rho_H_nuclei * dens_proper / mh;
+      double nH = rho_H_nuclei * dens_proper / constants::mH;
       if (nH <= 0.0) {
         continue;
       }
@@ -397,19 +397,19 @@ void grackle::impl::dust_destruction(
     InternalGrUnits internalu, IndexRange idx_range, const gr_mask_type* itmask,
     const double* dt_value, double dt_full, const double* t_gas,
     double* destruction_dM) {
-  grackle::impl::View<gr_float***> d(
+  grackle::impl::FortranView<gr_float***> d(
       my_fields->density, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> dust(
+  grackle::impl::FortranView<gr_float***> dust(
       my_fields->dust_density, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
   bool use_sne = (my_chemistry->use_sne_field > 0);
-  grackle::impl::View<gr_float***> sne(
+  grackle::impl::FortranView<gr_float***> sne(
       use_sne ? my_fields->sne_rate : my_fields->density,
       my_fields->grid_dimension[0], my_fields->grid_dimension[1],
       my_fields->grid_dimension[2]);
   bool use_tau_dest = (my_chemistry->use_tau_dest_field > 0);
-  grackle::impl::View<gr_float***> tau_dest_field(
+  grackle::impl::FortranView<gr_float***> tau_dest_field(
       use_tau_dest ? my_fields->tau_dest : my_fields->density,
       my_fields->grid_dimension[0], my_fields->grid_dimension[1],
       my_fields->grid_dimension[2]);
@@ -504,25 +504,25 @@ void grackle::impl::dust_destruction_species(
     double* destruction_dM_mg_silicate, double* destruction_dM_fe_silicate,
     double* destruction_dM_carbon) {
 
-  grackle::impl::View<gr_float***> d(
+  grackle::impl::FortranView<gr_float***> d(
       my_fields->density, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> dust_mg_sil(
+  grackle::impl::FortranView<gr_float***> dust_mg_sil(
       my_fields->dust_density_mg_silicate, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> dust_fe_sil(
+  grackle::impl::FortranView<gr_float***> dust_fe_sil(
       my_fields->dust_density_fe_silicate, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> dust_carb(
+  grackle::impl::FortranView<gr_float***> dust_carb(
       my_fields->dust_density_carbonaceous, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
   bool use_sne = (my_chemistry->use_sne_field > 0);
-  grackle::impl::View<gr_float***> sne(
+  grackle::impl::FortranView<gr_float***> sne(
       use_sne ? my_fields->sne_rate : my_fields->density,
       my_fields->grid_dimension[0], my_fields->grid_dimension[1],
       my_fields->grid_dimension[2]);
   bool use_tau_dest = (my_chemistry->use_tau_dest_field > 0);
-  grackle::impl::View<gr_float***> tau_dest_field(
+  grackle::impl::FortranView<gr_float***> tau_dest_field(
       use_tau_dest ? my_fields->tau_dest : my_fields->density,
       my_fields->grid_dimension[0], my_fields->grid_dimension[1],
       my_fields->grid_dimension[2]);
@@ -573,7 +573,7 @@ void grackle::impl::dust_destruction_species(
 
       double rho_H_nuclei = h_census.rho_H(i, idx_range.j, idx_range.k);
       if (rho_H_nuclei <= 0.0) continue;
-      double nH = rho_H_nuclei * dens_proper / mh;
+      double nH = rho_H_nuclei * dens_proper / constants::mH;
       if (nH <= 0.0) continue;
 
       // Common (species-independent) sputtering structural factor.
@@ -662,40 +662,40 @@ void grackle::impl::dust_update_species(
     const double* destruction_dM_mg_silicate,
     const double* destruction_dM_fe_silicate,
     const double* destruction_dM_carbon, bool dryrun) {
-  grackle::impl::View<gr_float***> d(
+  grackle::impl::FortranView<gr_float***> d(
       my_fields->density, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> dust(
+  grackle::impl::FortranView<gr_float***> dust(
       my_fields->dust_density, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> dust_sil(
+  grackle::impl::FortranView<gr_float***> dust_sil(
       my_fields->dust_density_silicate, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> dust_mg_sil(
+  grackle::impl::FortranView<gr_float***> dust_mg_sil(
       my_fields->dust_density_mg_silicate, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> dust_fe_sil(
+  grackle::impl::FortranView<gr_float***> dust_fe_sil(
       my_fields->dust_density_fe_silicate, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> dust_carb(
+  grackle::impl::FortranView<gr_float***> dust_carb(
       my_fields->dust_density_carbonaceous, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> metal(
+  grackle::impl::FortranView<gr_float***> metal(
       my_fields->metal_density, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> mC(
+  grackle::impl::FortranView<gr_float***> mC(
       my_fields->metal_density_carbon, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> mO(
+  grackle::impl::FortranView<gr_float***> mO(
       my_fields->metal_density_oxygen, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> mMg(
+  grackle::impl::FortranView<gr_float***> mMg(
       my_fields->metal_density_magnesium, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> mSi(
+  grackle::impl::FortranView<gr_float***> mSi(
       my_fields->metal_density_silicon, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> mFe(
+  grackle::impl::FortranView<gr_float***> mFe(
       my_fields->metal_density_iron, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
 
@@ -887,13 +887,13 @@ void grackle::impl::dust_update(chemistry_data* my_chemistry,
                                 const gr_mask_type* itmask,
                                 const double* dt_value, const double* growth_dM,
                                 const double* destruction_dM, bool dryrun) {
-  grackle::impl::View<gr_float***> d(
+  grackle::impl::FortranView<gr_float***> d(
       my_fields->density, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> dust(
+  grackle::impl::FortranView<gr_float***> dust(
       my_fields->dust_density, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> metal(
+  grackle::impl::FortranView<gr_float***> metal(
       my_fields->metal_density, my_fields->grid_dimension[0],
       my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
 

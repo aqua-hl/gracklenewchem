@@ -6,16 +6,16 @@
 //===----------------------------------------------------------------------===//
 ///
 /// @file
-/// Implements functions associated with GrainSpeciesInfo (namely, the
-/// new_GrainSpeciesInfo function)
+/// Implements logic associated with GrainSpeciesInfo
 ///
 //===----------------------------------------------------------------------===//
-
-#include <cstring>  // memcpy
 
 #include "LUT.hpp"
 #include "grain_species_info.hpp"
 #include "../support/FrozenKeyIdxBiMap.hpp"
+#include "support/expected.hpp"
+
+namespace GRIMPL_NAMESPACE_DECL {
 
 // The following logic effectively does 2 (related things):
 // 1. it serves as a human-readable registry of all known grain species and
@@ -51,12 +51,10 @@ namespace {  // stuff inside an anonymous namespace is local to this file
 /// - the @p growth_ingredients argument is terminated by the sentinel
 /// - the ingredient list in the returned instance is **NOT** terminated by
 ///   the sentinel
-grackle::impl::GrainSpeciesInfoEntry mk_gsp_info_entry_helper_(
+GrainSpeciesInfoEntry mk_gsp_info_entry_helper_(
     int species_idx, bool h2dust_uses_carbonaceous_table,
     double sublimation_temperature, double bulk_density_cgs,
-    const grackle::impl::GrainGrowthIngredient* growth_ingredients) {
-  using grackle::impl::GrainGrowthIngredient;
-
+    const GrainGrowthIngredient* growth_ingredients) {
   // the main "work" is to determine the number of specified growth_ingredients
   // and copy them (if there are no ingredients, we use a nullptr)
   GrainGrowthIngredient* out_ingredient_ptr = nullptr;
@@ -69,33 +67,29 @@ grackle::impl::GrainSpeciesInfoEntry mk_gsp_info_entry_helper_(
       n_ingredients++;
     }
     // allocate and initialize the pointer
-    out_ingredient_ptr =
-        new grackle::impl::GrainGrowthIngredient[n_ingredients];
+    out_ingredient_ptr = new GrainGrowthIngredient[n_ingredients];
     for (int i = 0; i < n_ingredients; i++) {
       out_ingredient_ptr[i] = growth_ingredients[i];
     }
   }
 
-  return grackle::impl::GrainSpeciesInfoEntry{species_idx,
-                                              h2dust_uses_carbonaceous_table,
-                                              sublimation_temperature,
-                                              bulk_density_cgs,
-                                              n_ingredients,
-                                              out_ingredient_ptr};
-}
-
-// ugh, I don't like this...
-grackle::impl::GrainSpeciesInfo mk_invalid_GrainSpeciesInfo() {
-  return {-1, nullptr, grackle::impl::mk_invalid_FrozenKeyIdxBiMap()};
+  return GrainSpeciesInfoEntry{species_idx,
+                               h2dust_uses_carbonaceous_table,
+                               sublimation_temperature,
+                               bulk_density_cgs,
+                               n_ingredients,
+                               out_ingredient_ptr};
 }
 
 }  // anonymous namespace
 
-grackle::impl::GrainSpeciesInfo grackle::impl::new_GrainSpeciesInfo(
+Expected<GrainSpeciesInfo, Error> GrainSpeciesInfo::create(
     int dust_species_parameter) {
   int n_species = get_n_grain_species(dust_species_parameter);
   if (n_species <= 0) {
-    return mk_invalid_GrainSpeciesInfo();
+    return Unexpected(Error::msg_literal(
+        "dust_species parameter doesn't correspond to a set of 1 or more dust "
+        "species"));
   }
 
   // names is allocated with the max number of known grain species
@@ -128,7 +122,7 @@ grackle::impl::GrainSpeciesInfo grackle::impl::new_GrainSpeciesInfo(
         // {coef, species_idx, particle mass}
         {1, SpLUT::Mg, 24.},
         {1, SpLUT::SiOI, 44.},
-        {2, SpLUT::H2O, 18.},
+        {2, SpLUT::H2OI, 18.},
         GRIMPL_INGREDIENT_LIST_SENTINEL};
     names[0] = "MgSiO3_dust";
     species_info[0] = mk_gsp_info_entry_helper_(
@@ -184,7 +178,7 @@ grackle::impl::GrainSpeciesInfo grackle::impl::new_GrainSpeciesInfo(
         // {coef, species_idx, particle mass}
         {2, SpLUT::Mg, 24.},
         {1, SpLUT::SiOI, 44.},
-        {3, SpLUT::H2O, 18.},
+        {3, SpLUT::H2OI, 18.},
         GRIMPL_INGREDIENT_LIST_SENTINEL};
     names[4] = "Mg2SiO4_dust";
     species_info[4] = mk_gsp_info_entry_helper_(
@@ -198,7 +192,7 @@ grackle::impl::GrainSpeciesInfo grackle::impl::new_GrainSpeciesInfo(
     const GrainGrowthIngredient Fe3O4_dust_ingred[] = {
         // {coef, species_idx, particle mass}
         {3, SpLUT::Fe, 56.},
-        {4, SpLUT::H2O, 18.},
+        {4, SpLUT::H2OI, 18.},
         GRIMPL_INGREDIENT_LIST_SENTINEL};
     names[5] = "Fe3O4_dust";
     species_info[5] = mk_gsp_info_entry_helper_(
@@ -225,7 +219,7 @@ grackle::impl::GrainSpeciesInfo grackle::impl::new_GrainSpeciesInfo(
     const GrainGrowthIngredient MgO_dust_ingred[] = {
         // {coef, species_idx, particle mass}
         {1, SpLUT::Mg, 24.},
-        {1, SpLUT::H2O, 18.},
+        {1, SpLUT::H2OI, 18.},
         GRIMPL_INGREDIENT_LIST_SENTINEL};
     names[7] = "MgO_dust";
     species_info[7] = mk_gsp_info_entry_helper_(
@@ -253,7 +247,7 @@ grackle::impl::GrainSpeciesInfo grackle::impl::new_GrainSpeciesInfo(
     const GrainGrowthIngredient Al2O3_dust_ingred[] = {
         // {coef, species_idx, particle mass}
         {2, SpLUT::Al, 27.},
-        {3, SpLUT::H2O, 18.},
+        {3, SpLUT::H2OI, 18.},
         GRIMPL_INGREDIENT_LIST_SENTINEL};
     names[9] = "Al2O3_dust";
     species_info[9] = mk_gsp_info_entry_helper_(
@@ -299,16 +293,23 @@ grackle::impl::GrainSpeciesInfo grackle::impl::new_GrainSpeciesInfo(
         /* growth_ingredients = */ nullptr);
   }
 
-  GrainSpeciesInfo out{
-      n_species, species_info,
-      new_FrozenKeyIdxBiMap(names, n_species, BiMapMode::COPIES_KEYDATA)};
+  Expected<FrozenKeyIdxBiMap, Error> name_map_rslt =
+      FrozenKeyIdxBiMap::create(names, n_species, BiMapMode::COPIES_KEYDATA);
 
-  if (FrozenKeyIdxBiMap_is_ok(&out.name_map)) {
-    return out;
+  if (!name_map_rslt.has_value()) {
+    GrainSpeciesInfo::cleanup_array_(n_species, species_info);
+    return Unexpected(
+        name_map_rslt.error().context_literal("can't build name_map"));
   } else {
-    drop_GrainSpeciesInfo(&out);
-    return mk_invalid_GrainSpeciesInfo();
+    GrainSpeciesInfo out;
+    out.n_species_ = n_species;
+    out.species_info_ = species_info;
+    out.dust_species_parameter_ = dust_species_parameter;
+    out.name_map_.swap(name_map_rslt.value());
+    return out;
   }
 }
+
+}  // namespace GRIMPL_NAMESPACE_DECL
 
 #undef GRIMPL_INGREDIENT_LIST_SENTINEL

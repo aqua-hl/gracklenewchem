@@ -15,6 +15,7 @@
 
 #include "cool1d_multi_g.hpp"
 #include "cooling_rate_contributions.hpp"
+#include "field_adaptor.hpp"
 #include "full_rxn_rate_buf.hpp"
 #include "gas_props.hpp"
 #include "grackle.h"
@@ -23,6 +24,7 @@
 #include "internal_types.hpp"
 #include "internal_units.hpp"
 #include "lookup_cool_rates1d.hpp"
+#include "mask.hpp"
 #include "rate_timestep_g.hpp"
 #include "scale_fields.hpp"
 #include "self_shielding_err_check.hpp"
@@ -55,7 +57,7 @@ photo_rate_storage contribution_uvb_rates(chemistry_data* my_chemistry,
                                           chemistry_data_storage* my_rates,
                                           code_units* my_units,
                                           int* ierr) {
-  photo_rate_storage my_uvb_rates;
+  photo_rate_storage my_uvb_rates{};
 
   my_uvb_rates.k24 = my_uvb_rates.k25 = my_uvb_rates.k26 =
       my_uvb_rates.k27 = my_uvb_rates.k28 = my_uvb_rates.k29 =
@@ -122,7 +124,6 @@ extern "C" int local_calculate_cooling_rate_contributions(
     return GR_FAIL;
   }
 
-  const int imetal = (my_fields->metal_density != NULL) ? TRUE : FALSE;
   GRIMPL_NS::InternalGrUnits internalu = GRIMPL_NS::new_internalu_(my_units);
 
   const gr_mask_type anydust =
@@ -140,30 +141,24 @@ extern "C" int local_calculate_cooling_rate_contributions(
   if (internalu.extfields_in_comoving == 1) {
     const gr_float factor = (gr_float)(std::pow(internalu.a_value, -3));
     GRIMPL_NS::scale_fields(
-        imetal, factor, my_chemistry, my_fields,
+        factor, my_chemistry, my_fields,
         GRIMPL_NS::get_n_inject_pathway_density_ptrs(my_rates));
   }
 
-  GRIMPL_NS::ceiling_species(imetal, my_chemistry, my_fields);
+  GRIMPL_NS::ceiling_species(my_chemistry, my_fields);
 
   const GRIMPL_NS::IndexHelper idx_helper =
       GRIMPL_NS::build_index_helper_(my_fields);
 
   OMP_PRAGMA("omp parallel")
   {
+    GRIMPL_NS::FieldAdaptorManager field_adaptor_mgr(my_fields);
     GRIMPL_NS::GrainSpeciesCollection grain_temperatures =
         GRIMPL_NS::new_GrainSpeciesCollection(my_fields->grid_dimension[0]);
     GRIMPL_NS::LnTLinInterpBuf logTlininterp_buf =
         GRIMPL_NS::new_LnTLinInterpBuf(my_fields->grid_dimension[0]);
-    GRIMPL_NS::Cool1DMultiScratchBuf cool1dmulti_buf =
-        GRIMPL_NS::new_Cool1DMultiScratchBuf(my_fields->grid_dimension[0]);
     GRIMPL_NS::CoolHeatScratchBuf coolingheating_buf =
         GRIMPL_NS::new_CoolHeatScratchBuf(my_fields->grid_dimension[0]);
-    GRIMPL_NS::InternalDustPropBuf internal_dust_prop_scratch_buf =
-        GRIMPL_NS::new_InternalDustPropBuf(
-            my_fields->grid_dimension[0],
-            GRIMPL_NS::GrainMetalInjectPathways_get_n_log10Tdust_vals(
-                my_rates->opaque_storage->inject_pathway_props));
     std::vector<double> dedot(my_fields->grid_dimension[0]);
     std::vector<double> HIdot(my_fields->grid_dimension[0]);
     GRIMPL_NS::FullRxnRateBuf rxn_rate_buf =
@@ -179,6 +174,7 @@ extern "C" int local_calculate_cooling_rate_contributions(
     std::vector<double> dust2gas(my_fields->grid_dimension[0]);
     std::vector<double> rhoH(my_fields->grid_dimension[0]);
     std::vector<double> edot(my_fields->grid_dimension[0]);
+    std::vector<double> alpha_continuum(my_fields->grid_dimension[0]);
 
     std::vector<gr_mask_type> itmask(my_fields->grid_dimension[0]);
     std::vector<gr_mask_type> itmask_metal(my_fields->grid_dimension[0]);
@@ -198,6 +194,8 @@ extern "C" int local_calculate_cooling_rate_contributions(
           GRIMPL_NS::make_idx_range_(t, &idx_helper);
       const int k = idx_range.k;
       const int j = idx_range.j;
+      const auto species_densities =
+          field_adaptor_mgr.get_species_data(idx_range);
 
       for (int channel = 0; channel < CoolingContributionFieldCount; channel++) {
         std::fill(contribution_storage[channel].begin() + idx_range.i_start,
@@ -211,26 +209,42 @@ extern "C" int local_calculate_cooling_rate_contributions(
 
       GRIMPL_NS::extended_gas_props(
           tgas.data(), mmw.data(), rhoH.data(), metallicity.data(),
-          nelec_times_mH.data(), logTlininterp_buf, imetal, itmask.data(),
+          nelec_times_mH.data(), logTlininterp_buf, itmask.data(),
           my_chemistry, &my_rates->cloudy_primordial, my_fields, internalu,
           idx_range, nullptr);
 
+      GRIMPL_NS::mask::adjust_from_Tfloor(
+          itmask.data(), tgas.data(), idx_range, my_chemistry, my_fields);
+      GRIMPL_NS::mask::fill_itmask_metal(
+          itmask_metal.data(), itmask.data(), metallicity.data(), idx_range,
+          my_chemistry);
+      for (int i = idx_range.i_start; i < idx_range.i_stop; i++) {
+        edot[i] = (itmask[i] == MASK_FALSE) ? tiny_fortran_val : 0.0;
+        alpha_continuum[i] = 0.0;
+      }
+
+      my_rates->opaque_storage->dust_solver.calc_Tdust_and_chem_contrib(
+          edot.data(), alpha_continuum.data(), &rxn_rate_buf,
+          dust2gas.data(), tdust.data(), grain_temperatures, tgas.data(),
+          rhoH.data(), nelec_times_mH.data(), metallicity.data(),
+          itmask.data(), itmask_metal.data(), my_chemistry, my_rates,
+          my_fields, species_densities, internalu, idx_range,
+          logTlininterp_buf, &contribution_scratch);
+
       GRIMPL_NS::cool1d_multi_g(
-          imetal, edot.data(), tgas.data(), mmw.data(), tdust.data(),
-          metallicity.data(), dust2gas.data(), rhoH.data(),
+          edot.data(), alpha_continuum.data(), tgas.data(), mmw.data(),
+          metallicity.data(), rhoH.data(),
           nelec_times_mH.data(), itmask.data(), itmask_metal.data(),
-          my_chemistry, my_rates, my_fields, my_uvb_rates, internalu,
-          idx_range, grain_temperatures, logTlininterp_buf, cool1dmulti_buf,
+          my_chemistry, my_rates, my_fields, species_densities,
+          my_uvb_rates, internalu, idx_range, logTlininterp_buf,
           coolingheating_buf, &contribution_scratch);
 
       if (my_chemistry->primordial_chemistry > 0) {
         GRIMPL_NS::lookup_cool_rates1d(
-            idx_range, anydust, tgas.data(), mmw.data(), tdust.data(),
-            dust2gas.data(), dom, dx_cgs, c_ljeans, itmask.data(),
-            itmask_metal.data(), dt_value, my_chemistry, my_rates, my_fields,
-            my_uvb_rates, internalu, grain_temperatures, logTlininterp_buf,
-            rxn_rate_buf, chemheatrates_buf,
-            internal_dust_prop_scratch_buf);
+            idx_range, tgas.data(), mmw.data(), dom, dx_cgs, c_ljeans,
+            itmask.data(), itmask_metal.data(), my_chemistry, my_rates,
+            my_fields, species_densities, my_uvb_rates, internalu,
+            logTlininterp_buf, rxn_rate_buf, chemheatrates_buf);
 
         GRIMPL_NS::rate_timestep_g(
             dedot.data(), HIdot.data(), anydust, rhoH.data(),
@@ -249,7 +263,7 @@ extern "C" int local_calculate_cooling_rate_contributions(
         for (int channel = 0; channel < CoolingContributionFieldCount;
              channel++) {
           if (output_fields[channel] != nullptr) {
-            GRIMPL_NS::View<gr_float***> output(
+            GRIMPL_NS::FortranView<gr_float***> output(
                 output_fields[channel], my_fields->grid_dimension[0],
                 my_fields->grid_dimension[1], my_fields->grid_dimension[2]);
             output(i, j, k) =
@@ -261,9 +275,7 @@ extern "C" int local_calculate_cooling_rate_contributions(
 
     GRIMPL_NS::drop_GrainSpeciesCollection(&grain_temperatures);
     GRIMPL_NS::drop_LnTLinInterpBuf(&logTlininterp_buf);
-    GRIMPL_NS::drop_Cool1DMultiScratchBuf(&cool1dmulti_buf);
     GRIMPL_NS::drop_CoolHeatScratchBuf(&coolingheating_buf);
-    GRIMPL_NS::drop_InternalDustPropBuf(&internal_dust_prop_scratch_buf);
     GRIMPL_NS::drop_FullRxnRateBuffer(&rxn_rate_buf);
     GRIMPL_NS::drop_ChemHeatingRates(&chemheatrates_buf);
   }
@@ -271,7 +283,7 @@ extern "C" int local_calculate_cooling_rate_contributions(
   if (internalu.extfields_in_comoving == 1) {
     const gr_float factor = (gr_float)(std::pow(internalu.a_value, 3));
     GRIMPL_NS::scale_fields(
-        imetal, factor, my_chemistry, my_fields,
+        factor, my_chemistry, my_fields,
         GRIMPL_NS::get_n_inject_pathway_density_ptrs(my_rates));
   }
 

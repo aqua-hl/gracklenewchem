@@ -28,7 +28,9 @@
 #include "internal_units.hpp"
 #include "lookup_cool_rates1d.hpp"
 #include "make_consistent.hpp"
+#include "mask.hpp"
 #include "opaque_storage.hpp"
+#include "step_rate_gauss_seidel.hpp"
 #include "step_rate_newton_raphson.hpp"
 #include "support/config.hpp"
 #include "utils-cpp.hpp"
@@ -70,10 +72,10 @@ static void enforce_max_heatcool_subcycle_dt_(
   const chemistry_data* my_chemistry, const grackle_field_data* my_fields
 ) {
 
-  View<const gr_float***> d(my_fields->density, my_fields->grid_dimension[0],
+  FortranView<const gr_float***> d(my_fields->density, my_fields->grid_dimension[0],
                             my_fields->grid_dimension[1],
                             my_fields->grid_dimension[2]);
-  View<const gr_float***> specific_eint(my_fields->internal_energy,
+  FortranView<const gr_float***> specific_eint(my_fields->internal_energy,
                                         my_fields->grid_dimension[0],
                                         my_fields->grid_dimension[1],
                                         my_fields->grid_dimension[2]);
@@ -144,8 +146,6 @@ static void enforce_max_heatcool_subcycle_dt_(
 /// @param[out] imp_eng Buffer for `idx_range` where the choice of
 ///     energy-evolution handling is recorded for the Newton-Raphson scheme
 /// @param[in]  mask_len the length of the iteration masks
-/// @param[in]  imetal specifies whether or not the caller provided a metal
-///     density field
 /// @param[in]  min_metallicity specifies the minimum metallicity where we
 ///     consider metal chemistry/cooling
 /// @param[in]  ddom specifies precomputed product of mass density and the
@@ -155,14 +155,12 @@ static void enforce_max_heatcool_subcycle_dt_(
 static void setup_chem_scheme_masks_(
   GRIMPL_NS::IndexRange idx_range, const gr_mask_type* itmask,
   gr_mask_type* itmask_gs, gr_mask_type* itmask_nr, int* imp_eng, int mask_len,
-  int imetal, double min_metallicity, const double* ddom, const double* tgas,
+  double min_metallicity, const double* ddom, const double* tgas,
   const double* metallicity, const chemistry_data* my_chemistry
 ) {
 
   std::memcpy(itmask_gs, itmask, sizeof(gr_mask_type)*mask_len);
   std::memcpy(itmask_nr, itmask, sizeof(gr_mask_type)*mask_len);
-
-  // would it be more robust to use my_chemistry->metal_cooling than imetal?
 
   // netwon-raphson solver can only coevolves energy when this is true
   const bool has_nr_coevolve_eint_prereqs = (
@@ -172,7 +170,7 @@ static void setup_chem_scheme_masks_(
 
   for (int i = idx_range.i_start; i < idx_range.i_stop; i++) {
     if ( itmask[i] != MASK_FALSE )  {
-      bool usemetal = (imetal == 1) && (metallicity[i] > min_metallicity);
+      bool usemetal = (my_chemistry->metal_cooling == 1) && (metallicity[i] > min_metallicity);
       bool is_hi_dens;
       if (my_chemistry->solver_method == 2) {
         // Force Gauss-Seidel
@@ -407,23 +405,23 @@ static void set_subcycle_dt_from_chemistry_scheme_(
   const int j = idx_range.j;
   const int k = idx_range.k;
 
-  grackle::impl::View<gr_float***> de(my_fields->e_density,
+  FortranView<gr_float***> de(my_fields->e_density,
                                       my_fields->grid_dimension[0],
                                       my_fields->grid_dimension[1],
                                       my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> HI(my_fields->HI_density,
+  FortranView<gr_float***> HI(my_fields->HI_density,
                                       my_fields->grid_dimension[0],
                                       my_fields->grid_dimension[1],
                                       my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> HII(my_fields->HII_density,
+  FortranView<gr_float***> HII(my_fields->HII_density,
                                        my_fields->grid_dimension[0],
                                        my_fields->grid_dimension[1],
                                        my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> d(my_fields->density,
+  FortranView<gr_float***> d(my_fields->density,
                                      my_fields->grid_dimension[0],
                                      my_fields->grid_dimension[1],
                                      my_fields->grid_dimension[2]);
-  grackle::impl::View<gr_float***> e(my_fields->internal_energy,
+  FortranView<gr_float***> e(my_fields->internal_energy,
                                      my_fields->grid_dimension[0],
                                      my_fields->grid_dimension[1],
                                      my_fields->grid_dimension[2]);
@@ -531,7 +529,7 @@ static inline void coupled_rt_modify_itmask_(
   grackle_field_data* my_fields
 )
 {
-  grackle::impl::View<const gr_float***> kphHI(my_fields->RT_HI_ionization_rate,
+  FortranView<const gr_float***> kphHI(my_fields->HI_ionization_rate,
                                                my_fields->grid_dimension[0],
                                                my_fields->grid_dimension[1],
                                                my_fields->grid_dimension[2]);
@@ -539,8 +537,7 @@ static inline void coupled_rt_modify_itmask_(
   // adjust iteration mask if the caller indicates that they're using
   // Grackle in a coupled radiative-transfer/chemistry-energy calculation
   // (that has intermediate steps)
-  if (my_chemistry->use_radiative_transfer == 1 &&
-      my_chemistry->radiative_transfer_coupled_rate_solver == 1)  {
+  if (my_chemistry->radiative_transfer_coupled_rate_solver == 1)  {
     // we only define behavior for radiative_transfer_intermediate_step
     // values of 0 or 1
 
@@ -608,11 +605,6 @@ struct SpeciesRateSolverScratchBuf {
   /// buffer specifying how the Newton-Raphson scheme handles energy evolution
   int* imp_eng;
 
-  // buffers in the following data structure are used to temporarily hold
-  // the evolved density of various species as we evolve over a subcycle
-  // (currently only used by step_rate_g)
-  grackle::impl::SpeciesCollection species_tmpdens;
-
   /// buffers in the following data structure are used to temporarily hold
   /// all reaction rates
   FullRxnRateBuf rxn_rate_buf;
@@ -629,7 +621,8 @@ struct SpeciesRateSolverScratchBuf {
 template <class BinaryVisitor>
 void visit_member_pair(SpeciesRateSolverScratchBuf& obj0,
                        SpeciesRateSolverScratchBuf& obj1,
-                       BinaryVisitor f) {
+                       BinaryVisitor f,
+                       bool managing_memory = false) {
   namespace vis = ::grackle::impl::visitor;
 
   vis::begin_visit("SpeciesRateSolverScratchBuf", f);
@@ -641,9 +634,6 @@ void visit_member_pair(SpeciesRateSolverScratchBuf& obj0,
   f(VIS_MEMBER_NAME("itmask_gs"), obj0.itmask_gs, obj1.itmask_gs, vis::idx_range_len_multiple(1));
   f(VIS_MEMBER_NAME("itmask_nr"), obj0.itmask_nr, obj1.itmask_nr, vis::idx_range_len_multiple(1));
   f(VIS_MEMBER_NAME("imp_eng"), obj0.imp_eng, obj1.imp_eng, vis::idx_range_len_multiple(1));
-
-  vis::previsit_struct_member(VIS_MEMBER_NAME("species_tmpdens"), f);
-  visit_member_pair(obj0.species_tmpdens, obj1.species_tmpdens, f);
 
   vis::previsit_struct_member(VIS_MEMBER_NAME("rxn_rate_buf"), f);
   visit_member_pair(obj0.rxn_rate_buf, obj1.rxn_rate_buf, f);
@@ -684,7 +674,7 @@ void drop_SpeciesRateSolverScratchBuf(SpeciesRateSolverScratchBuf* ptr) {
 
 
 int solve_rate_cool(
-  int imetal, double dt, InternalGrUnits internalu,
+  double dt, InternalGrUnits internalu,
   chemistry_data* my_chemistry, chemistry_data_storage* my_rates,
   grackle_field_data* my_fields, photo_rate_storage* my_uvb_rates
 )
@@ -699,9 +689,9 @@ int solve_rate_cool(
   // Set error indicator (we will return this value)
   int ierr = GR_SUCCESS;
 
-  // Set flag for dust-related options
+  // Set flag for dust-related reaction rates
   const gr_mask_type anydust =
-    ((my_chemistry->h2_on_dust > 0)  ||  (my_chemistry->dust_chemistry > 0))
+    (DustSolver::any_dust_rxn_rates(*my_chemistry))
     ? MASK_TRUE
     : MASK_FALSE;
 
@@ -727,11 +717,11 @@ int solve_rate_cool(
   if (internalu.extfields_in_comoving == 1)  {
     gr_float factor = (gr_float)(std::pow(internalu.a_value,(-3)) );
     grackle::impl::scale_fields(
-        imetal, factor, my_chemistry, my_fields,
+        factor, my_chemistry, my_fields,
         grackle::impl::get_n_inject_pathway_density_ptrs(my_rates));
   }
 
-  grackle::impl::ceiling_species(imetal, my_chemistry, my_fields);
+  grackle::impl::ceiling_species(my_chemistry, my_fields);
 
   const IndexHelper idx_helper = build_index_helper_(my_fields);
 
@@ -740,6 +730,8 @@ int solve_rate_cool(
     // each OMP thread separately initializes/allocates variables defined in
     // the current scope and then enters the for-loop
 
+    FieldAdaptorManager field_adaptor_mgr(my_fields);
+
     // holds computed grain temperatures:
     grackle::impl::GrainSpeciesCollection grain_temperatures =
       grackle::impl::new_GrainSpeciesCollection(my_fields->grid_dimension[0]);
@@ -747,11 +739,16 @@ int solve_rate_cool(
     grackle::impl::LnTLinInterpBuf logTlininterp_buf =
       grackle::impl::new_LnTLinInterpBuf(my_fields->grid_dimension[0]);
 
-    grackle::impl::Cool1DMultiScratchBuf cool1dmulti_buf =
-      grackle::impl::new_Cool1DMultiScratchBuf(my_fields->grid_dimension[0]);
-
     grackle::impl::CoolHeatScratchBuf coolingheating_buf =
       grackle::impl::new_CoolHeatScratchBuf(my_fields->grid_dimension[0]);
+
+    // buffers in the following data structure are used to temporarily hold
+    // the evolved density of various species as we evolve over a subcycle
+    // - currently only used by step_rate_gauss_seidel
+    // - this can't be part of SpeciesRateSolverScratchBuf because we depend on
+    //   allocating all memory in a single buffer (which currently doesn't work)
+    SpeciesCollection species_tmpdens =
+      new_SpeciesCollection(my_fields->grid_dimension[0]);
 
     // at the time of writing, the following scratch buffer is **ONLY** used
     // within lookup_cool_rates1d. In the future, we should really work on
@@ -786,6 +783,7 @@ int solve_rate_cool(
     std::vector<double> dust2gas(my_fields->grid_dimension[0]);
     std::vector<double> rhoH(my_fields->grid_dimension[0]);
     std::vector<double> mmw(my_fields->grid_dimension[0]);
+    std::vector<double> alpha_continuum(my_fields->grid_dimension[0]);
     // when primordial_chemistry > 0, this buffer simply holds copies of
     // of the e_density field
     std::vector<double> nelec_times_mH(my_fields->grid_dimension[0]);
@@ -814,11 +812,11 @@ int solve_rate_cool(
     LnTPreparer lnT_preparer(tgasold_.data());
 
     // create views of density and internal energy fields to support 3D access
-    grackle::impl::View<gr_float***> d(my_fields->density,
+    FortranView<gr_float***> d(my_fields->density,
                                        my_fields->grid_dimension[0],
                                        my_fields->grid_dimension[1],
                                        my_fields->grid_dimension[2]);
-    grackle::impl::View<gr_float***> e(my_fields->internal_energy,
+    FortranView<gr_float***> e(my_fields->internal_energy,
                                        my_fields->grid_dimension[0],
                                        my_fields->grid_dimension[1],
                                        my_fields->grid_dimension[2]);
@@ -833,6 +831,9 @@ int solve_rate_cool(
       const IndexRange idx_range = make_idx_range_(t, &idx_helper);
       const int k = idx_range.k; // use 0-based index
       const int j = idx_range.j; // use 0-based index
+
+      SpeciesMultiView<gr_float> sp_densities
+          = field_adaptor_mgr.get_species_data(idx_range);
 
       // `tolerance = 1.0e-06_DKIND * dt` was some commented logic in the
       // original fortran subroutine in this location
@@ -878,7 +879,7 @@ int solve_rate_cool(
         // and fill up logTlinterp_buf
         extended_gas_props(tgas.data(), mmw.data(), rhoH.data(),
                            metallicity.data(), nelec_times_mH.data(),
-                           logTlininterp_buf, imetal, itmask.data(),
+                           logTlininterp_buf, itmask.data(),
                            my_chemistry, &my_rates->cloudy_primordial,
                            my_fields, internalu, idx_range,
                            // if (iter == 1), we act as if there was a previous
@@ -889,21 +890,54 @@ int solve_rate_cool(
         // "damping" when we fill up logTlininterp_buf)
         lnT_preparer.record_T(idx_range, itmask.data(), tgas.data());
 
+        // Adjust itmask based on Tfloor and fill itmask_metal
+        mask::adjust_from_Tfloor(itmask.data(), tgas.data(), idx_range,
+                                 my_chemistry, my_fields);
+        mask::fill_itmask_metal(itmask_metal.data(), itmask.data(),
+                                metallicity.data(), idx_range,
+                                my_chemistry);
+
+        // Initialize edot and alpha_continuum
+        // -> we primarily set edot to tiny_fortran_val for historical
+        //    consistency with the behavior of Tfloor.
+        // -> it would be better to set it to 0 and modify the subcycle timestep
+        //    to explicitly work around an edot of 0. This makes Grackle more
+        //    robust for simulations where the initial conditions are in
+        //    thermal equilibrium (edot = 0) by construction
+        for (int i = idx_range.i_start; i < idx_range.i_stop; i++) {
+          edot[i] = (itmask[i] == MASK_FALSE) * tiny_fortran_val;
+          // the above line is a branchless version of
+          // edot[i] = (itmask[i] == MASK_FALSE) ? tiny_fortran_val : 0.0;
+          alpha_continuum[i] = 0.0;
+        }
+
+
+        // now, handle specifics of our dust model. This includes:
+        // - computing Tdust (tdust or grain_temperatures may be filled)
+        // - computing dust2gas (for some dust models)
+        // - add contributions to alpha_continuum (for some dust models)
+        // - add contributions to edot from dust
+        // - computing/storing dust-related reaction rates in rxn_rate_buf
+        my_rates->opaque_storage->dust_solver.calc_Tdust_and_chem_contrib(
+            edot.data(), alpha_continuum.data(), &spsolvbuf.rxn_rate_buf,
+            dust2gas.data(), tdust.data(), grain_temperatures, tgas.data(),
+            rhoH.data(), nelec_times_mH.data(), metallicity.data(),
+            itmask.data(), itmask_metal.data(), my_chemistry, my_rates,
+            my_fields, sp_densities, internalu, idx_range, logTlininterp_buf);
+
         // Compute the edot values (so we can get the cooling time)
-        // -> at this time the function also fillls dust2gas and tdust. It can
-        //    also modify itmask and itmask_metal
+        // -> at this time the function also fillls dust2gas and tdust.
         // -> (we plan to factor out the extra calculations)
         cool1d_multi_g(
-          imetal,
-          edot.data(),
-          tgas.data(), mmw.data(), tdust.data(), metallicity.data(),
-          dust2gas.data(), rhoH.data(), nelec_times_mH.data(), itmask.data(),
+          edot.data(), alpha_continuum.data(),
+          tgas.data(), mmw.data(), metallicity.data(),
+           rhoH.data(), nelec_times_mH.data(), itmask.data(),
           itmask_metal.data(), my_chemistry,
-          my_rates, my_fields,
+          my_rates, my_fields, sp_densities,
           *my_uvb_rates, internalu,
           idx_range,
-          grain_temperatures, logTlininterp_buf,
-          cool1dmulti_buf, coolingheating_buf
+          logTlininterp_buf,
+          coolingheating_buf
         );
 
         if (my_chemistry->primordial_chemistry > 0)  {
@@ -913,15 +947,12 @@ int solve_rate_cool(
           //
           // -> TODO: passing dt to this function is probably incorrect. See
           //    the C++ docstring for a longer discussion
-          grackle::impl::lookup_cool_rates1d(
-            idx_range, anydust, tgas.data(), mmw.data(), tdust.data(),
-            dust2gas.data(), dom, dx_cgs, c_ljeans, itmask.data(),
-            itmask_metal.data(), dt, my_chemistry,
-            my_rates, my_fields, *my_uvb_rates, internalu,
-            grain_temperatures, logTlininterp_buf,
-            spsolvbuf.rxn_rate_buf, spsolvbuf.chemheatrates_buf,
-            internal_dust_prop_scratch_buf
-          );
+          lookup_cool_rates1d(
+              idx_range, tgas.data(), mmw.data(), dom, dx_cgs, c_ljeans,
+              itmask.data(), itmask_metal.data(), my_chemistry,
+              my_rates, my_fields, sp_densities, *my_uvb_rates, internalu,
+              logTlininterp_buf, spsolvbuf.rxn_rate_buf,
+              spsolvbuf.chemheatrates_buf);
 
           // Compute dedot and HIdot, the rates of change of de and HI
           //   (should add itmask to this call)
@@ -939,7 +970,7 @@ int solve_rate_cool(
           //    => high-density: Newton-Raphson scheme, tracked by itmask_nr
           setup_chem_scheme_masks_(
             idx_range, itmask.data(), spsolvbuf.itmask_gs, spsolvbuf.itmask_nr,
-            spsolvbuf.imp_eng, my_fields->grid_dimension[0], imetal,
+            spsolvbuf.imp_eng, my_fields->grid_dimension[0],
             min_metallicity, spsolvbuf.ddom, tgas.data(), metallicity.data(),
             my_chemistry
           );
@@ -992,20 +1023,20 @@ int solve_rate_cool(
             dtit.data(), idx_range, anydust, rhoH.data(),
             spsolvbuf.dedot_prev, spsolvbuf.HIdot_prev, spsolvbuf.itmask_gs,
             itmask_metal.data(), my_chemistry, my_fields,
-            spsolvbuf.species_tmpdens, spsolvbuf.rxn_rate_buf
+            species_tmpdens, spsolvbuf.rxn_rate_buf
           );
 
           // Solve rate equations with one linearly implicit Gauss-Seidel
           // sweep of a backward Euler method (for all cells specified by
           // itmask_nr)
           grackle::impl::step_rate_newton_raphson(
-            imetal, idx_range, iter, dom, chunit, dx_cgs, c_ljeans,
+            idx_range, dom, chunit, dx_cgs, c_ljeans,
             dtit.data(), tgas.data(), tdust.data(),
             metallicity.data(), dust2gas.data(), rhoH.data(), mmw.data(),
             nelec_times_mH.data(), edot.data(), anydust, spsolvbuf.itmask_nr,
             itmask_metal.data(), spsolvbuf.imp_eng, my_chemistry, my_rates,
-            my_fields, *my_uvb_rates, internalu, grain_temperatures,
-            logTlininterp_buf, cool1dmulti_buf, coolingheating_buf,
+            my_fields, sp_densities, *my_uvb_rates, internalu,
+            grain_temperatures, logTlininterp_buf, coolingheating_buf,
             spsolvbuf.chemheatrates_buf
           );
 
@@ -1112,8 +1143,8 @@ int solve_rate_cool(
     // cleanup manually allocated temporaries
     grackle::impl::drop_GrainSpeciesCollection(&grain_temperatures);
     grackle::impl::drop_LnTLinInterpBuf(&logTlininterp_buf);
-    grackle::impl::drop_Cool1DMultiScratchBuf(&cool1dmulti_buf);
     grackle::impl::drop_CoolHeatScratchBuf(&coolingheating_buf);
+    drop_SpeciesCollection(&species_tmpdens);
     grackle::impl::drop_InternalDustPropBuf(&internal_dust_prop_scratch_buf);
 
     grackle::impl::drop_SpeciesRateSolverScratchBuf(&spsolvbuf);
@@ -1131,7 +1162,7 @@ int solve_rate_cool(
   if (internalu.extfields_in_comoving == 1)  {
     gr_float factor = (gr_float)(std::pow(internalu.a_value,3) );
     grackle::impl::scale_fields(
-        imetal, factor, my_chemistry, my_fields,
+        factor, my_chemistry, my_fields,
         grackle::impl::get_n_inject_pathway_density_ptrs(my_rates));
   }
 
@@ -1140,7 +1171,7 @@ int solve_rate_cool(
     // Correct the species to ensure consistency (i.e. type conservation)
 
     grackle::impl::make_consistent(
-        imetal, dom, my_chemistry,
+        dom, my_chemistry,
         my_rates->opaque_storage->inject_pathway_props, my_fields);
 
   }
