@@ -301,12 +301,21 @@ def parse_args(args=None):
                         help="Initial gas density in cm^-3.")
     parser.add_argument("--final-nH", type=float, default=1e10,
                         help="Final gas density in cm^-3.")
-    parser.add_argument("--initial-temperature", type=float, default=5e4,
+    parser.add_argument("--initial-temperature", type=float, default=5e6,
                         help="Initial gas temperature in K.")
-    parser.add_argument("--cooling-temperature", type=float, default=1e4,
+    parser.add_argument("--cooling-temperature", type=float, default=1e6,
                         help="Constant-density pre-cooling target in K.")
     parser.add_argument("--isrf", type=float, default=1,
                         help="Interstellar radiation field in Habing units.")
+    parser.add_argument(
+        "--uvb-data-file",
+        type=os.path.abspath,
+        default=None,
+        help=(
+            "UV-background HDF5 table. Supplying this option enables the "
+            "UV background; by default the no-UVB table is used."
+        ),
+    )
     parser.add_argument("--three-body-rate", type=int, default=1,
                         help="Grackle three_body_rate selector.")
     parser.add_argument(
@@ -435,7 +444,7 @@ def apply_common_chemistry_options(my_chemistry, opts, overrides=None):
         "multi_metals": 0,
         "metal_abundances": 0,
         "dust_chemistry": 1,
-        "UVbackground": 0,
+        "UVbackground": int(opts.uvb_data_file is not None),
         "cmb_temperature_floor": 1,
         "Gamma": 1.66667,
         "h2_on_dust": 1,
@@ -481,15 +490,17 @@ def apply_common_chemistry_options(my_chemistry, opts, overrides=None):
         "radiative_transfer_coupled_rate_solver": 0,
         "radiative_transfer_intermediate_step": 0,
         "radiative_transfer_hydrogen_only": 0,
-        "self_shielding_method": 0,
+        "self_shielding_method": 3,
         "H2_custom_shielding": 0,
         "H2_self_shielding": 0,
         "radiative_transfer_H2II_diss": 1,
         "radiative_transfer_HDI_diss": 1,
         "radiative_transfer_metal_ionization": 0,
         "radiative_transfer_metal_diss": 0,
-        "grackle_data_file": os.path.join(
-            grackle_data_dir, "CloudyData_noUVB.h5"
+        "grackle_data_file": (
+            opts.uvb_data_file
+            if opts.uvb_data_file is not None
+            else os.path.join(grackle_data_dir, "HM2012_metal_test.h5")
         ),
     }
     if overrides:
@@ -1536,6 +1547,7 @@ def save_contribution_data(results, opts):
         "use_multiple_dust_temperatures": bool(opts.use_multiple_dust_temperatures),
         "grain_growth": bool(opts.grain_growth),
         "isrf_habing": opts.isrf,
+        "uvb_data_file": opts.uvb_data_file,
         "diagnostic_dt": opts.diagnostic_dt,
         "note": (
             "Cooling contributions are additive terms recorded from "
@@ -1598,6 +1610,7 @@ def main(args=None):
         print(f"  final nH            = {opts.final_nH:.3e} cm^-3")
         print(f"  cooling target      = {opts.cooling_temperature:.3g} K")
     print(f"  ISRF                = {opts.isrf:g} Habing")
+    print(f"  UV background       = {opts.uvb_data_file or 'off'}")
 
     for metallicity in opts.metallicities:
         print(f"Running Z={metallicity:g} Zsun...")
@@ -1614,43 +1627,43 @@ def main(args=None):
     if want("temperature_density"):
         plot_temperature_sweep(results, opts)
     if not opts.skip_diagnostics:
-        if want("cooling_channel_rates"):
-            plot_contributions(
-                results, opts, suffix="cooling_channel_rates",
-            )
-        if want("cooling_channel_fractions"):
-            plot_fractional_contributions(
-                results, opts, suffix="cooling_channel_fractions",
-            )
-        if want("cooling_channel_rates_signed"):
-            plot_signed_symlog_contributions(
-                results, opts, fractions=False,
-                suffix="cooling_channel_rates_signed",
-            )
-        if want("cooling_channel_fractions_signed"):
-            plot_signed_symlog_contributions(
-                results, opts, fractions=True,
-                suffix="cooling_channel_fractions_signed",
-            )
-        if want("thermal_balance"):
-            plot_thermal_balance(results, opts)
+        # if want("cooling_channel_rates"):
+        #     plot_contributions(
+        #         results, opts, suffix="cooling_channel_rates",
+        #     )
+        # if want("cooling_channel_fractions"):
+        #     plot_fractional_contributions(
+        #         results, opts, suffix="cooling_channel_fractions",
+        #     )
+        # if want("cooling_channel_rates_signed"):
+        #     plot_signed_symlog_contributions(
+        #         results, opts, fractions=False,
+        #         suffix="cooling_channel_rates_signed",
+        #     )
+        # if want("cooling_channel_fractions_signed"):
+        #     plot_signed_symlog_contributions(
+        #         results, opts, fractions=True,
+        #         suffix="cooling_channel_fractions_signed",
+        #     )
+        # if want("thermal_balance"):
+        #     plot_thermal_balance(results, opts)
         if want("dominant_budget_stack"):
             plot_dominant_budget_stack(results, opts)
-        if want("chemistry_reaction_fractions"):
-            plot_fractional_contributions(
-                results, opts, channel_order=_CHEMISTRY_DETAIL_PLOT_ORDER,
-                suffix="chemistry_reaction_fractions",
-                title_note="chemistry reaction magnitudes only",
-            )
-        if want("chemistry_reaction_fractions_signed"):
-            plot_signed_symlog_contributions(
-                results, opts, fractions=True,
-                channel_order=_CHEMISTRY_DETAIL_PLOT_ORDER,
-                suffix="chemistry_reaction_fractions_signed",
-            )
+        # if want("chemistry_reaction_fractions"):
+        #     plot_fractional_contributions(
+        #         results, opts, channel_order=_CHEMISTRY_DETAIL_PLOT_ORDER,
+        #         suffix="chemistry_reaction_fractions",
+        #         title_note="chemistry reaction magnitudes only",
+        #     )
+        # if want("chemistry_reaction_fractions_signed"):
+        #     plot_signed_symlog_contributions(
+        #         results, opts, fractions=True,
+        #         channel_order=_CHEMISTRY_DETAIL_PLOT_ORDER,
+        #         suffix="chemistry_reaction_fractions_signed",
+        #     )
         print_chemistry_detail_summary(results, opts)
-        save_chemistry_detail_csv(results, opts)
-        save_contribution_data(results, opts)
+        # save_chemistry_detail_csv(results, opts)
+        # save_contribution_data(results, opts)
     return 0
 
 

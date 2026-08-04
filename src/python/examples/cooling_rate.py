@@ -55,7 +55,7 @@ def main(args=None):
         in_testing_framework = True
 
     else:  # Just run the script as is.
-        metallicity = 1. # Solar
+        metallicity = 0 # Solar
         redshift = 0.
         specific_heating_rate = 0.
         volumetric_heating_rate = 0.
@@ -96,7 +96,7 @@ def main(args=None):
     # Call convenience function for setting up a fluid container.
     # This container holds the solver parameters, units, and fields.
     metal_mass_fraction = metallicity * my_chemistry.SolarMetalFractionByMass
-    temperature = np.logspace(1, 9, 200)
+    temperature = np.logspace(1, 7, 200)
     fc = setup_fluid_container(
         my_chemistry,
         density=mass_hydrogen_cgs,

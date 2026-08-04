@@ -421,7 +421,7 @@ void grackle::impl::dust_destruction(
   // 2019], converted to code density * code volume.
   double Ms100 = 6800.0 * my_chemistry->sne_coeff *
                  (100.0 / my_chemistry->sne_shockspeed) *
-                 (100.0 / my_chemistry->sne_shockspeed) * SolarMass /
+                 (100.0 / my_chemistry->sne_shockspeed) * constants::SolarMass /
                  (internalu.urho * std::pow(internalu.uxyz, 3));
 
   for (int i = idx_range.i_start; i < idx_range.i_stop; i++) {
@@ -534,7 +534,7 @@ void grackle::impl::dust_destruction_species(
   // [REF: McKee 1989; used as in Li, Narayanan & Dave 2019].
   double Ms100 = 6800.0 * my_chemistry->sne_coeff *
                  (100.0 / my_chemistry->sne_shockspeed) *
-                 (100.0 / my_chemistry->sne_shockspeed) * SolarMass /
+                 (100.0 / my_chemistry->sne_shockspeed) * constants::SolarMass /
                  (internalu.urho * std::pow(internalu.uxyz, 3));
 
   // Species-specific shock-vulnerability multipliers. Graphite is the
