@@ -95,6 +95,22 @@ typedef struct
   /* Flag to solve metal chemistry */
   int metal_chemistry;
 
+  /* Certified skeletal-reduction level for the explicit metal network
+     (network_reduction analysis, 2026-08). Removed reactions have their
+     rate tables zeroed and are dropped from the interpolation list, so any
+     remaining term vanishes exactly; removed species' update equations are
+     skipped and their densities stay frozen at their input values.
+     0) full network (default)
+     1) drop kz23, kz25, kz31, kz53                    (candidate_eps1em3)
+     2) additionally drop the silicon chain (SiI, SiOI, SiO2I) and
+        kz18, kz19, kz24, kz32, kz52, kz54             (candidate_eps1em2)
+     3) additionally drop CO2 and kz26                 (candidate_eps1em1)
+     Certified against the full network for nH <= 1e4 cm^-3, T <= 1e4 K,
+     0 <= Z/Zsun <= 1, with and without the UV background, at
+     dust_species = 0 (levels >= 2 skip the SiM/MgSiO3/Mg2SiO4/SiO2 grain
+     growth coupling together with the silicon species). */
+  int metal_network_reduction;
+
   /* minimum temperature to include tabulated metal cooling.
      This is used to supplement the non-equilibrium metal cooling
      from setting metal_chemistry=1, which is only valid up to T~1e4 K.

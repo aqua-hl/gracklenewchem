@@ -958,15 +958,19 @@ inline void species_density_updates_gauss_seidel(
             ( 1. + acoef*dtit[i] );
 
 
-        // ***** CO2I *********
-        scoef = 0. + 44. * ( 0.
-            + kcol_buf[CollisionalRxnLUT::kz26][i] *    OHI[i] *    COI[i] / 476.
-           );
-        acoef = 0.;
+        // ***** CO2I ********* (frozen at metal_network_reduction >= 3)
+        if (my_chemistry->metal_network_reduction < 3) {
+          scoef = 0. + 44. * ( 0.
+              + kcol_buf[CollisionalRxnLUT::kz26][i] *    OHI[i] *    COI[i] / 476.
+             );
+          acoef = 0.;
 
-        out_spdens(spid.metal(MetalSpLUT::CO2I), i) =
-            ( scoef*dtit[i] + CO2I[i] ) /
-            ( 1. + acoef*dtit[i] );
+          out_spdens(spid.metal(MetalSpLUT::CO2I), i) =
+              ( scoef*dtit[i] + CO2I[i] ) /
+              ( 1. + acoef*dtit[i] );
+        } else {
+          out_spdens(spid.metal(MetalSpLUT::CO2I), i) = CO2I[i];
+        }
 
 
         // ***** OI **********
@@ -1079,62 +1083,74 @@ inline void species_density_updates_gauss_seidel(
             ( 1. + acoef*dtit[i] );
 
 
-        // ***** SiI **********
-        scoef = 0. + 28. * ( 0.
-           );
-        acoef = 0.
-            + kcol_buf[CollisionalRxnLUT::kz52][i] *    OHI[i] / 17.
-            + kcol_buf[CollisionalRxnLUT::kz53][i] *    O2I[i] / 32.;
-        if (chiaki_model_dust_evolution)  {
-          if (my_chemistry->dust_species > 1)  {
-            acoef = acoef
-            + grain_growth_rates[OnlyGrainSpLUT::SiM_dust]     [i] / SiI[i] * 28.;
+        // ***** SiI ********** (frozen at metal_network_reduction >= 2)
+        if (my_chemistry->metal_network_reduction < 2) {
+          scoef = 0. + 28. * ( 0.
+             );
+          acoef = 0.
+              + kcol_buf[CollisionalRxnLUT::kz52][i] *    OHI[i] / 17.
+              + kcol_buf[CollisionalRxnLUT::kz53][i] *    O2I[i] / 32.;
+          if (chiaki_model_dust_evolution)  {
+            if (my_chemistry->dust_species > 1)  {
+              acoef = acoef
+              + grain_growth_rates[OnlyGrainSpLUT::SiM_dust]     [i] / SiI[i] * 28.;
+            }
           }
+
+          out_spdens(spid.metal(MetalSpLUT::SiI), i) =
+              ( scoef*dtit[i] + SiI[i] ) /
+              ( 1. + acoef*dtit[i] );
+        } else {
+          out_spdens(spid.metal(MetalSpLUT::SiI), i) = SiI[i];
         }
 
-        out_spdens(spid.metal(MetalSpLUT::SiI), i) =
-            ( scoef*dtit[i] + SiI[i] ) /
-            ( 1. + acoef*dtit[i] );
 
+        // ***** SiOI ********** (frozen at metal_network_reduction >= 2)
+        if (my_chemistry->metal_network_reduction < 2) {
+          scoef = 0. + 44. * ( 0.
+              + kcol_buf[CollisionalRxnLUT::kz52][i] *   SiI[i] *    OHI[i] / 476.
+              + kcol_buf[CollisionalRxnLUT::kz53][i] *   SiI[i] *    O2I[i] / 896.
+             );
+          acoef = 0.
+              + kcol_buf[CollisionalRxnLUT::kz54][i] *    OHI[i] / 17.;
+          if (chiaki_model_dust_evolution)  {
+            if (my_chemistry->dust_species > 0)  {
+              acoef = acoef
+              + grain_growth_rates[OnlyGrainSpLUT::MgSiO3_dust]  [i] / SiOI[i] * 44.;
+            }
+            if (my_chemistry->dust_species > 1)  {
+              acoef = acoef
+              + grain_growth_rates[OnlyGrainSpLUT::Mg2SiO4_dust] [i] / SiOI[i] * 44.;
+            }
+          }
 
-        // ***** SiOI **********
-        scoef = 0. + 44. * ( 0.
-            + kcol_buf[CollisionalRxnLUT::kz52][i] *   SiI[i] *    OHI[i] / 476.
-            + kcol_buf[CollisionalRxnLUT::kz53][i] *   SiI[i] *    O2I[i] / 896.
-           );
-        acoef = 0.
-            + kcol_buf[CollisionalRxnLUT::kz54][i] *    OHI[i] / 17.;
-        if (chiaki_model_dust_evolution)  {
-          if (my_chemistry->dust_species > 0)  {
-            acoef = acoef
-            + grain_growth_rates[OnlyGrainSpLUT::MgSiO3_dust]  [i] / SiOI[i] * 44.;
-          }
-          if (my_chemistry->dust_species > 1)  {
-            acoef = acoef
-            + grain_growth_rates[OnlyGrainSpLUT::Mg2SiO4_dust] [i] / SiOI[i] * 44.;
-          }
+          out_spdens(spid.metal(MetalSpLUT::SiOI), i) =
+              ( scoef*dtit[i] + SiOI[i] ) /
+              ( 1. + acoef*dtit[i] );
+        } else {
+          out_spdens(spid.metal(MetalSpLUT::SiOI), i) = SiOI[i];
         }
 
-        out_spdens(spid.metal(MetalSpLUT::SiOI), i) =
-            ( scoef*dtit[i] + SiOI[i] ) /
-            ( 1. + acoef*dtit[i] );
 
-
-        // ***** SiO2I **********
-        scoef = 0. + 60. * ( 0.
-            + kcol_buf[CollisionalRxnLUT::kz54][i] *  SiOI[i] *    OHI[i] / 748.
-           );
-        acoef = 0.;
-        if (chiaki_model_dust_evolution)  {
-          if (my_chemistry->dust_species > 1)  {
-            acoef = acoef
-            + grain_growth_rates[OnlyGrainSpLUT::SiO2_dust]   [i] / SiO2I[i] * 60.;
+        // ***** SiO2I ********** (frozen at metal_network_reduction >= 2)
+        if (my_chemistry->metal_network_reduction < 2) {
+          scoef = 0. + 60. * ( 0.
+              + kcol_buf[CollisionalRxnLUT::kz54][i] *  SiOI[i] *    OHI[i] / 748.
+             );
+          acoef = 0.;
+          if (chiaki_model_dust_evolution)  {
+            if (my_chemistry->dust_species > 1)  {
+              acoef = acoef
+              + grain_growth_rates[OnlyGrainSpLUT::SiO2_dust]   [i] / SiO2I[i] * 60.;
+            }
           }
-        }
 
-        out_spdens(spid.metal(MetalSpLUT::SiO2I), i) =
-            ( scoef*dtit[i] + SiO2I[i] ) /
-            ( 1. + acoef*dtit[i] );
+          out_spdens(spid.metal(MetalSpLUT::SiO2I), i) =
+              ( scoef*dtit[i] + SiO2I[i] ) /
+              ( 1. + acoef*dtit[i] );
+        } else {
+          out_spdens(spid.metal(MetalSpLUT::SiO2I), i) = SiO2I[i];
+        }
 
         // MINOR BUT IMPORTANT SPECIES FOR MOLECULAR FORMATION
         //- ***** CH **********
@@ -2310,15 +2326,17 @@ inline void species_density_derivatives_0d(
 
 
 
-      // ***** CO2I *********
-      scoef = 0. + 44. * ( 0.
-          + kcol_buf[CollisionalRxnLUT::kz26][0]    *   OHI        *   COI        / 476.
-         );
-      acoef = 0.;
+      // ***** CO2I ********* (frozen at metal_network_reduction >= 3)
+      if (my_chemistry->metal_network_reduction < 3) {
+        scoef = 0. + 44. * ( 0.
+            + kcol_buf[CollisionalRxnLUT::kz26][0]    *   OHI        *   COI        / 476.
+           );
+        acoef = 0.;
 
-      deriv(spid.metal(MetalSpLUT::CO2I), 0) =
-          deriv(spid.metal(MetalSpLUT::CO2I), 0) +
-          (scoef - acoef * CO2I);
+        deriv(spid.metal(MetalSpLUT::CO2I), 0) =
+            deriv(spid.metal(MetalSpLUT::CO2I), 0) +
+            (scoef - acoef * CO2I);
+      }
 
 
 
@@ -2436,64 +2454,70 @@ inline void species_density_derivatives_0d(
 
 
 
-      // ***** SiI **********
-      scoef = 0. + 28. * ( 0.
-         );
-      acoef = 0.
-          + kcol_buf[CollisionalRxnLUT::kz52][0]    *   OHI        / 17.
-          + kcol_buf[CollisionalRxnLUT::kz53][0]    *   O2I        / 32.;
-      if (chiaki_model_dust_evolution)  {
-        if (my_chemistry->dust_species > 1)  {
-          acoef = acoef
-          + grain_growth_rates[OnlyGrainSpLUT::SiM_dust][0]         / SiI        * 28.;
+      // ***** SiI ********** (frozen at metal_network_reduction >= 2)
+      if (my_chemistry->metal_network_reduction < 2) {
+        scoef = 0. + 28. * ( 0.
+           );
+        acoef = 0.
+            + kcol_buf[CollisionalRxnLUT::kz52][0]    *   OHI        / 17.
+            + kcol_buf[CollisionalRxnLUT::kz53][0]    *   O2I        / 32.;
+        if (chiaki_model_dust_evolution)  {
+          if (my_chemistry->dust_species > 1)  {
+            acoef = acoef
+            + grain_growth_rates[OnlyGrainSpLUT::SiM_dust][0]         / SiI        * 28.;
+          }
         }
+
+        deriv(spid.metal(MetalSpLUT::SiI), 0) =
+            deriv(spid.metal(MetalSpLUT::SiI), 0) +
+            (scoef - acoef * SiI);
       }
 
-      deriv(spid.metal(MetalSpLUT::SiI), 0) =
-          deriv(spid.metal(MetalSpLUT::SiI), 0) +
-          (scoef - acoef * SiI);
 
 
-
-      // ***** SiOI **********
-      scoef = 0. + 44. * ( 0.
-          + kcol_buf[CollisionalRxnLUT::kz52][0]    *   SiI        *   OHI        / 476.
-          + kcol_buf[CollisionalRxnLUT::kz53][0]    *   SiI        *   O2I        / 896.
-         );
-      acoef = 0.
-          + kcol_buf[CollisionalRxnLUT::kz54][0]    *   OHI        / 17.;
-      if (chiaki_model_dust_evolution)  {
-        if (my_chemistry->dust_species > 0)  {
-          acoef = acoef
-          + grain_growth_rates[OnlyGrainSpLUT::MgSiO3_dust][0]      / SiOI        * 44.;
+      // ***** SiOI ********** (frozen at metal_network_reduction >= 2)
+      if (my_chemistry->metal_network_reduction < 2) {
+        scoef = 0. + 44. * ( 0.
+            + kcol_buf[CollisionalRxnLUT::kz52][0]    *   SiI        *   OHI        / 476.
+            + kcol_buf[CollisionalRxnLUT::kz53][0]    *   SiI        *   O2I        / 896.
+           );
+        acoef = 0.
+            + kcol_buf[CollisionalRxnLUT::kz54][0]    *   OHI        / 17.;
+        if (chiaki_model_dust_evolution)  {
+          if (my_chemistry->dust_species > 0)  {
+            acoef = acoef
+            + grain_growth_rates[OnlyGrainSpLUT::MgSiO3_dust][0]      / SiOI        * 44.;
+          }
+          if (my_chemistry->dust_species > 1)  {
+            acoef = acoef
+            + grain_growth_rates[OnlyGrainSpLUT::Mg2SiO4_dust][0]     / SiOI        * 44.;
+          }
         }
-        if (my_chemistry->dust_species > 1)  {
-          acoef = acoef
-          + grain_growth_rates[OnlyGrainSpLUT::Mg2SiO4_dust][0]     / SiOI        * 44.;
-        }
+
+        deriv(spid.metal(MetalSpLUT::SiOI), 0) =
+            deriv(spid.metal(MetalSpLUT::SiOI), 0) +
+            (scoef - acoef * SiOI);
       }
 
-      deriv(spid.metal(MetalSpLUT::SiOI), 0) =
-          deriv(spid.metal(MetalSpLUT::SiOI), 0) +
-          (scoef - acoef * SiOI);
 
 
-
-      // ***** SiO2I **********
-      scoef = 0. + 60. * ( 0.
-          + kcol_buf[CollisionalRxnLUT::kz54][0]    *  SiOI        *   OHI        / 748.
-         );
-      acoef = 0.;
-      if (chiaki_model_dust_evolution)  {
-        if (my_chemistry->dust_species > 1)  {
-          acoef = acoef
-          + grain_growth_rates[OnlyGrainSpLUT::SiO2_dust][0]       / SiO2I        * 60.;
+      // ***** SiO2I ********** (frozen at metal_network_reduction >= 2)
+      if (my_chemistry->metal_network_reduction < 2) {
+        scoef = 0. + 60. * ( 0.
+            + kcol_buf[CollisionalRxnLUT::kz54][0]    *  SiOI        *   OHI        / 748.
+           );
+        acoef = 0.;
+        if (chiaki_model_dust_evolution)  {
+          if (my_chemistry->dust_species > 1)  {
+            acoef = acoef
+            + grain_growth_rates[OnlyGrainSpLUT::SiO2_dust][0]       / SiO2I        * 60.;
+          }
         }
-      }
 
-      deriv(spid.metal(MetalSpLUT::SiO2I), 0) =
-          deriv(spid.metal(MetalSpLUT::SiO2I), 0) +
-          (scoef - acoef * SiO2I);
+        deriv(spid.metal(MetalSpLUT::SiO2I), 0) =
+            deriv(spid.metal(MetalSpLUT::SiO2I), 0) +
+            (scoef - acoef * SiO2I);
+      }
 
 
 
