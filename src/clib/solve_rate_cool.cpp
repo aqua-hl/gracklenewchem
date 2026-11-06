@@ -815,6 +815,11 @@ int solve_rate_cool(
         previous_edot[i] = 0.;
         thermal_slope[i] = 0.;
         sign_flips[i] = 0;
+        // The GS rate limiter (iter > 50) compares against the change seen in
+        // this cell's previous GS subcycle. These buffers are reused across
+        // rows and are not initialized, so start each row with no history.
+        spsolvbuf.dedot_prev[i] = huge8;
+        spsolvbuf.HIdot_prev[i] = huge8;
       }
 
       // A useful slice variable since we do this a lot
@@ -1065,6 +1070,14 @@ int solve_rate_cool(
             itmask_metal.data(), spsolvbuf.imp_eng, my_chemistry, my_rates,
             my_fields, *my_uvb_rates, internalu, grain_temperatures,
             logTlininterp_buf, coolingheating_buf, spsolvbuf.chemheatrates_buf);
+        // An NR substep leaves the GS change history stale: a cell that later
+        // returns to GS must not limit its step with rates from before it.
+        for (int i = idx_range.i_start; i < idx_range.i_stop; ++i) {
+          if (spsolvbuf.itmask_nr[i] != MASK_FALSE) {
+            spsolvbuf.dedot_prev[i] = huge8;
+            spsolvbuf.HIdot_prev[i] = huge8;
+          }
+        }
         if (!nr_ok) {
           OMP_PRAGMA_CRITICAL
           {
