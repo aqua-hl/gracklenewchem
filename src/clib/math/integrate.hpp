@@ -391,8 +391,18 @@ public:  // public API
         vec[i] *= s[i];
         ycur_minus_ystart[i] += vec[i];
         y[i] += vec[i];
-        if (!std::isfinite(y[i]) || !std::isfinite(vec[i]) || y[i] < 0.) {
+        if (!std::isfinite(y[i]) || !std::isfinite(vec[i]) ||
+            y[i] < -absolute_tolerance[i]) {
           return IntegrateResult{TerminateFlag::OTHER_ERR, k};
+        }
+        if (y[i] < 0.) {
+          // A negative excursion below the absolute tolerance is roundoff,
+          // e.g. a trace species that single-precision fields can only hold
+          // as a denormal (~1e-45): the RHS sees it quantized and Newton
+          // overshoots by that much. Treat it as zero instead of failing.
+          ycur_minus_ystart[i] -= y[i];
+          vec[i] -= y[i];
+          y[i] = 0.;
         }
         const double scale = std::fabs(y[i]) + absolute_tolerance[i] / max_rtol_;
         const double err = (scale > 0.) ? std::fabs(vec[i]) / scale
