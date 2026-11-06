@@ -74,7 +74,7 @@ public:  // public API
 
   // upper bound on the scratch space needed in step
   int num_scratch_buf_elements() const noexcept {
-    int n_vectors = 3;   // f, vec and ycur_minus_ystart
+    int n_vectors = 4;   // f, vec, ycur_minus_ystart and (modified) scale
     int n_matrices = 2;  // jacobian_f and mtrx
     int entries_per_matrix = max_evolved_variables_ * max_evolved_variables_;
     return n_vectors * max_evolved_variables_ + n_matrices * entries_per_matrix;
@@ -321,6 +321,97 @@ public:  // public API
     }
 
     // we have exceeded maxiter
+    return IntegrateResult{TerminateFlag::CONVERGE_ERR, maxiter_ + 1};
+  }
+
+  /// Modified Newton variant of @ref step for the adaptive integrator.
+  ///
+  /// `shared_jacobian` (may be null) is reused for every iteration, so an
+  /// iteration costs one evaluation of `calc_f` instead of n + 1. When the
+  /// correction shrinks by less than half per iteration the Jacobian is
+  /// rebuilt at the current iterate (at most 3 times). `f_at_start` (may be
+  /// null) is f(y) at entry. Components and equations are scaled as in
+  /// @ref step; `absolute_tolerance` is required. Iterates must stay
+  /// non-negative and finite. A Jacobian whose columns conserve the RHS's
+  /// linear invariants keeps those invariants for every iterate.
+  template <typename FnF, typename FnFJ>
+  IntegrateResult step_modified(double* y, double h, const FnF& calc_f,
+                                const FnFJ& calc_f_and_jacobian, int n,
+                                double* scratch_ptr,
+                                const double* absolute_tolerance,
+                                const View<double**>* shared_jacobian,
+                                const double* f_at_start) const {
+    double* ycur_minus_ystart = scratch_ptr;
+    double* vec = ycur_minus_ystart + n;
+    double* f = vec + n;
+    double* s = f + n;
+    View<double**> jac_local(s + n, n, n);
+    View<double**> mtrx(s + n + n * n, n, n);
+    const View<double**>* J = shared_jacobian;
+    bool f_ready = false;
+    if (f_at_start != nullptr) {
+      for (int i = 0; i < n; i++) { f[i] = f_at_start[i]; }
+      f_ready = true;
+    }
+    if (J == nullptr) {
+      calc_f_and_jacobian(y, f, jac_local);
+      J = &jac_local;
+      f_ready = true;
+    }
+    for (int i = 0; i < n; i++) { ycur_minus_ystart[i] = 0.0; }
+    double previous = -1.0;
+    int refreshes = 0;
+    for (int k = 0; k < maxiter_; k++) {
+      if (!f_ready) { calc_f(y, f); }
+      f_ready = false;
+      for (int i = 0; i < n; i++) {
+        if (!std::isfinite(f[i])) {
+          return IntegrateResult{TerminateFlag::OTHER_ERR, k};
+        }
+        s[i] = std::fmax(std::fabs(y[i]), absolute_tolerance[i] / max_rtol_);
+        if (s[i] == 0.) { s[i] = 1.; }
+      }
+      // gaussj overwrites the matrix, so (I - h J) is rebuilt each iteration;
+      // that costs O(n^2) and no RHS evaluations.
+      for (int i = 0; i < n; i++) {
+        vec[i] = (f[i] * h - ycur_minus_ystart[i]) / s[i];
+        for (int j = 0; j < n; j++) {
+          const double a = ((i == j) ? 1.0 : 0.0) - h * (*J)(i, j);
+          mtrx(i, j) = a * s[j] / s[i];
+          if (!std::isfinite(mtrx(i, j))) {
+            return IntegrateResult{TerminateFlag::OTHER_ERR, k};
+          }
+        }
+      }
+      if (gaussj(n, mtrx.data(), vec) == 1) {
+        return IntegrateResult{TerminateFlag::OTHER_ERR, k};
+      }
+      double max_rel = 0.0;
+      for (int i = 0; i < n; i++) {
+        vec[i] *= s[i];
+        ycur_minus_ystart[i] += vec[i];
+        y[i] += vec[i];
+        if (!std::isfinite(y[i]) || !std::isfinite(vec[i]) || y[i] < 0.) {
+          return IntegrateResult{TerminateFlag::OTHER_ERR, k};
+        }
+        const double scale = std::fabs(y[i]) + absolute_tolerance[i] / max_rtol_;
+        const double err = (scale > 0.) ? std::fabs(vec[i]) / scale
+                                        : (vec[i] == 0. ? 0. : HUGE_VAL);
+        max_rel = std::fmax(max_rel, err);
+      }
+      if (max_rel <= max_rtol_) {
+        return IntegrateResult{TerminateFlag::CONVERGED, k + 1};
+      }
+      if (previous > 0. && max_rel > 0.5 * previous && refreshes < 3) {
+        calc_f_and_jacobian(y, f, jac_local);
+        J = &jac_local;
+        f_ready = true;
+        ++refreshes;
+        previous = -1.0;
+        continue;
+      }
+      previous = max_rel;
+    }
     return IntegrateResult{TerminateFlag::CONVERGE_ERR, maxiter_ + 1};
   }
 };

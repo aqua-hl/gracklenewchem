@@ -217,20 +217,21 @@ inline bool step_rate_newton_raphson(
   // the accepted interval, with bounded retries and thermal stability guards.
   constexpr double relative_tolerance = 1.e-3;
   // The RHS evaluates gr_float fields, even though Newton iterates in double.
-  // Its convergence tolerance must therefore accommodate field roundoff.
+  // Its convergence tolerance must therefore accommodate field roundoff. It
+  // only needs to be small next to the 1e-3 error tolerance.
   constexpr double nonlinear_tolerance = std::max(
-    1.e-8, 32.*std::numeric_limits<gr_float>::epsilon());
+    1.e-6, 32.*std::numeric_limits<gr_float>::epsilon());
+  // Resolve finite differences above the precision of the RHS fields.
+  constexpr double eps = (std::numeric_limits<gr_float>::digits <
+                          std::numeric_limits<double>::digits) ? 1.e-2 : 1.e-4;
   integrate::AdaptiveBackwardEuler ode_solver(
-    i_eng, relative_tolerance, 0.1, 40, nonlinear_tolerance);
+    i_eng, relative_tolerance, 0.1, 40, nonlinear_tolerance, eps);
 
   std::vector<double> ode_scratch_buf(ode_solver.num_scratch_buf_elements());
 
   // (In the future, we may want to reconsider when/how we allocate
   // the following 3 variables)
   std::vector<int> idsp;
-  // Resolve finite differences above the precision of the RHS fields.
-  constexpr double eps = (std::numeric_limits<gr_float>::digits <
-                          std::numeric_limits<double>::digits) ? 1.e-2 : 1.e-4;
 
   // allocate some scratch buffers. In the future, when we refactor to support
   // calculations of the time derivatives of multiple values at once, we should
@@ -608,6 +609,20 @@ inline bool step_rate_newton_raphson(
         }
       };
 
+      // f(y) alone: one RHS evaluation (Newton reuses the Jacobian)
+      const auto calc_f = [&](const double* reduced_dsp_in,
+                              double* reduced_dspdot) -> void {
+        for (int isp = 0; isp < nsp; isp++) {
+          full_dsp_buf[idsp[isp]] = reduced_dsp_in[isp];
+        }
+        wrapped_calc_derivatives(dt_FIXME, full_dsp_buf.data(),
+                                 full_dspdot_buf.data(), pack,
+                                 rhosp_grflt, rhosp_dot);
+        for (int isp = 0; isp < nsp; isp++) {
+          reduced_dspdot[isp] = full_dspdot_buf[idsp[isp]];
+        }
+      };
+
       for (int isp = 0; isp < nsp; ++isp) {
         reduced_dsp[isp] = dsp[idsp[isp]];
         // The helper's fractional-change scale is atol / relative_tolerance.
@@ -620,7 +635,8 @@ inline bool step_rate_newton_raphson(
       const int energy_index = (imp_eng[i] == 1) ? nsp-1 : -1;
       const auto result = ode_solver.step(
         reduced_dsp.data(), dtit[i], minimum_subcycle_dt[i],
-        calc_f_and_jacobian, nsp, energy_index, absolute_tolerance.data(),
+        calc_f_and_jacobian, calc_f, nsp, energy_index,
+        absolute_tolerance.data(),
         ode_scratch_buf.data(), d(i,j,k));
       if (!result.converged() || !std::isfinite(result.accepted_dt) ||
           result.accepted_dt < minimum_subcycle_dt[i]) {

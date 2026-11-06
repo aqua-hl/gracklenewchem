@@ -8,8 +8,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <initializer_list>
 #include <limits>
+#include <vector>
 
 #include "integrate.hpp"
 
@@ -39,11 +41,17 @@ struct AdaptiveIntegrateResult {
 /// We require h*J_ee <= 0.1 at the start, midpoint, and endpoint. This prevents
 /// large backward-Euler steps from spuriously damping that growing mode.
 /// It does not assert stability of every eigenmode of a coupled network.
+///
+/// Cost: the Jacobian at the start of a substep is computed once and reused
+/// by all three backward-Euler solves (modified Newton, rebuilt only when the
+/// iteration contracts slowly). The guard needs only J_ee, so it costs two
+/// RHS evaluations per candidate state instead of a full Jacobian.
 class AdaptiveBackwardEuler {
   int max_variables_;
   double relative_tolerance_;
   double max_fractional_change_;
   int max_retries_;
+  double jacobian_step_;  // relative energy perturbation for the J_ee guard
   StiffNewtonRaphson newton_;
 
   static bool valid_state_(const double* y, int n, int energy_index) {
@@ -71,16 +79,18 @@ public:
                                  double relative_tolerance = 1.e-3,
                                  double max_fractional_change = 0.1,
                                  int max_retries = 40,
-                                 double nonlinear_tolerance = 1.e-8)
+                                 double nonlinear_tolerance = 1.e-8,
+                                 double jacobian_step = 1.e-4)
       : max_variables_(max_variables),
         relative_tolerance_(relative_tolerance),
         max_fractional_change_(max_fractional_change),
         max_retries_(max_retries),
+        jacobian_step_(jacobian_step),
         newton_(max_variables, nonlinear_tolerance, 20) {}
 
   int num_scratch_buf_elements() const noexcept {
-    // Six vectors and one matrix, plus the Newton solver's scratch space.
-    return 6 * max_variables_ + max_variables_ * max_variables_
+    // Nine vectors and one matrix, plus the Newton solver's scratch space.
+    return 9 * max_variables_ + max_variables_ * max_variables_
       + newton_.num_scratch_buf_elements();
   }
 
@@ -93,16 +103,23 @@ public:
   /// relative changes in abundant species. The caller should choose the
   /// abundance scale from its conserved elemental densities.
   ///
+  /// Components that are stiff and stable at the trial step
+  /// (h * -J_ii > 10 at the start state) are exempt from the fractional-change
+  /// limiter: backward Euler holds them at their quasi-equilibrium with the
+  /// slower components, and the step-doubling error estimate still controls
+  /// them. Without this, fast trace species (H-, H2+) force ~1e-5 tau steps.
+  ///
   /// minimum_dt should include the caller's floating-point progress floor
   /// (for example, nextafter(elapsed, +infinity)-elapsed). If a safe accurate
   /// step cannot exceed that floor within max_retries, failure is explicit.
   /// Set energy_index=-1 for a species-only system. calc_f_and_jacobian has
-  /// the same interface as StiffNewtonRaphson::step.
-  template <typename Fn>
+  /// the same interface as StiffNewtonRaphson::step; calc_f(y, f) evaluates
+  /// only f(y).
+  template <typename Fn, typename FnF>
   AdaptiveIntegrateResult step(
       double* y, double proposed_dt, double minimum_dt,
-      const Fn& calc_f_and_jacobian, int n, int energy_index,
-      const double* absolute_tolerance, double* scratch,
+      const Fn& calc_f_and_jacobian, const FnF& calc_f, int n,
+      int energy_index, const double* absolute_tolerance, double* scratch,
       double local_density = 1.0) const {
     const double infinity = std::numeric_limits<double>::infinity();
     AdaptiveIntegrateResult result{
@@ -124,7 +141,10 @@ public:
     double* middle = fine + n;
     double* f = middle + n;
     double* newton_atol = f + n;
-    View<double**> jac(newton_atol + n, n, n);
+    double* f_initial = newton_atol + n;
+    double* probe = f_initial + n;
+    double* f_probe = probe + n;
+    View<double**> jac(f_probe + n, n, n);
     double* newton_scratch = jac.data() + n * n;
 
     for (int i = 0; i < n; ++i) {
@@ -135,8 +155,9 @@ public:
       // Newton errors must remain small compared with the error estimator.
       newton_atol[i] = 1.e-4 * absolute_tolerance[i];
     }
-    calc_f_and_jacobian(initial, f, jac);
-    if (!finite_derivatives_(f, jac, n)) { return result; }
+    // The start-state f and Jacobian are reused by every solve below.
+    calc_f_and_jacobian(initial, f_initial, jac);
+    if (!finite_derivatives_(f_initial, jac, n)) { return result; }
 
     double h = proposed_dt;
     const double initial_thermal_j =
@@ -144,16 +165,20 @@ public:
     if (initial_thermal_j > 0.) {
       h = std::min(h, 0.1 / initial_thermal_j);
     }
+    const auto slaved = [&](int i, double step) {
+      return jac(i, i) < 0. && -jac(i, i) * step > 10.;
+    };
 
     // A diagonal linearized backward-Euler predictor avoids repeatedly
     // halving a cosmological step just to resolve an initial transient.
     // Acceptance still uses the full coupled solutions below; this predictor
     // makes no claim that off-diagonal couplings can be neglected.
     for (int i = 0; i < n; ++i) {
+      if (slaved(i, h)) { continue; }
       const double scale = std::max(std::fabs(initial[i]),
                                    absolute_tolerance[i] / relative_tolerance_);
       const double limit = max_fractional_change_ * scale;
-      const double excess = std::fabs(f[i])
+      const double excess = std::fabs(f_initial[i])
         - limit * std::max(0., -jac(i, i));
       if (excess > 0.) { h = std::min(h, limit / excess); }
     }
@@ -169,34 +194,47 @@ public:
 
       std::copy(initial, initial + n, full);
       std::copy(initial, initial + n, fine);
-      auto run_newton = [&](double* state, double step_dt) {
-        IntegrateResult nr = newton_.step(
-          state, step_dt, calc_f_and_jacobian, n, newton_scratch, true,
-          local_density, newton_atol, true);
+      auto run_newton = [&](double* state, double step_dt,
+                            const double* f_start) {
+        IntegrateResult nr = newton_.step_modified(
+          state, step_dt, calc_f, calc_f_and_jacobian, n, newton_scratch,
+          newton_atol, &jac, f_start);
         result.newton_iterations += nr.iterations;
         return nr.converged() && valid_state_(state, n, energy_index);
       };
 
-      if (!run_newton(full, h) || !run_newton(fine, 0.5 * h)) {
+      if (!run_newton(full, h, f_initial) ||
+          !run_newton(fine, 0.5 * h, f_initial)) {
         h *= 0.5;
         continue;
       }
       std::copy(fine, fine + n, middle);
-      if (!run_newton(fine, 0.5 * h)) {
+      if (!run_newton(fine, 0.5 * h, nullptr)) {
         h *= 0.5;
         continue;
       }
 
       // Check the entire candidate path, not only the initial derivative.
+      // Only J_ee is needed: one perturbed RHS evaluation per candidate.
       double max_positive_j = std::max(0., initial_thermal_j);
       bool finite_candidate = true;
       if (energy_index >= 0) {
         for (const double* candidate : {middle, fine}) {
-          calc_f_and_jacobian(candidate, f, jac);
-          finite_candidate = finite_candidate && finite_derivatives_(f, jac, n);
+          calc_f(candidate, f);
+          std::copy(candidate, candidate + n, probe);
+          const double de = jacobian_step_ *
+            std::max(std::fabs(candidate[energy_index]),
+                     std::numeric_limits<double>::min());
+          probe[energy_index] += de;
+          calc_f(probe, f_probe);
+          const double jee = (f_probe[energy_index] - f[energy_index]) / de;
+          bool ok = std::isfinite(jee);
+          for (int i = 0; i < n; ++i) {
+            ok = ok && std::isfinite(f[i]) && std::isfinite(f_probe[i]);
+          }
+          finite_candidate = finite_candidate && ok;
           if (finite_candidate) {
-            max_positive_j = std::max(max_positive_j,
-                                      jac(energy_index, energy_index));
+            max_positive_j = std::max(max_positive_j, jee);
           }
         }
       }
@@ -221,8 +259,9 @@ public:
           * std::max(std::fabs(initial[i]),
                      absolute_tolerance[i] / relative_tolerance_);
         const double change_delta = std::fabs(fine[i] - initial[i]);
-        const double change_i = (change_scale > 0.) ? change_delta / change_scale
-                               : (change_delta == 0. ? 0. : infinity);
+        const double change_i = slaved(i, h) ? 0. :
+          (change_scale > 0.) ? change_delta / change_scale
+                              : (change_delta == 0. ? 0. : infinity);
         error = std::max(error, err_i);
         change = std::max(change, change_i);
       }
@@ -250,6 +289,22 @@ public:
     }
     result.suggested_dt = h;
     return result;
+  }
+
+  /// Convenience overload for callers without a separate f-only function.
+  template <typename Fn>
+  AdaptiveIntegrateResult step(
+      double* y, double proposed_dt, double minimum_dt,
+      const Fn& calc_f_and_jacobian, int n, int energy_index,
+      const double* absolute_tolerance, double* scratch,
+      double local_density = 1.0) const {
+    std::vector<double> jac_buf(static_cast<std::size_t>(n > 0 ? n * n : 1));
+    const auto calc_f = [&](const double* state, double* f_out) {
+      View<double**> unused(jac_buf.data(), n, n);
+      calc_f_and_jacobian(state, f_out, unused);
+    };
+    return step(y, proposed_dt, minimum_dt, calc_f_and_jacobian, calc_f, n,
+                energy_index, absolute_tolerance, scratch, local_density);
   }
 };
 

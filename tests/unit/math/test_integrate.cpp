@@ -387,7 +387,11 @@ TEST(AdaptiveBackwardEuler, ResolvesHotAndColdTransientsThenRelaxes) {
       auto result = adaptive_step(y, 1.e5 - elapsed, rhs);
       ASSERT_TRUE(result.converged()) << "initial energy = " << initial;
       ASSERT_GT(result.accepted_dt, 0.);
-      EXPECT_LE(std::fabs(y[0] - old), .1 * old * (1. + 1.e-12));
+      // |J| = 1: the 10% change limit applies until the mode is slaved by
+      // backward Euler (h|J| > 10); then the step may land on equilibrium.
+      if (result.accepted_dt <= 10.) {
+        EXPECT_LE(std::fabs(y[0] - old), .1 * old * (1. + 1.e-12));
+      }
       EXPECT_LE(result.error_norm, 1.);
       elapsed += result.accepted_dt;
       ++substeps;

@@ -639,8 +639,11 @@ For all on/off integer flags, 0 is off and 1 is on.
    accept the latter. The relative error tolerance is 0.001. Species have an
    additional absolute tolerance of ``1e-13 * density`` in code units, and
    accepted changes are limited to 10 percent relative to the initial value
-   or a trace-abundance scale of ``1e-10 * density``. These controls are local
-   timestep criteria, not a bound on the global integration error.
+   or a trace-abundance scale of ``1e-10 * density``. Components that are
+   stiff at the trial step (``h * |J_ii| > 10``, e.g. fast trace species held
+   at quasi-equilibrium) are exempt from the change limit but not from the
+   error tolerance. These controls are local timestep criteria, not a bound
+   on the global integration error.
 
    The thermal derivative is evaluated with species held fixed. For a positive
    derivative, the timestep resolves its growth timescale instead of damping
