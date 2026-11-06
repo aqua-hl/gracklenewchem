@@ -17,6 +17,9 @@
 #include <cstdlib> // std::malloc, std::free
 #include <cstring> // std::memcpy
 #include <vector>
+#include <limits>
+#include <memory>
+#include "thermal_probe.hpp"
 #include "gas_props.hpp"
 #include "grackle.h"
 
@@ -125,76 +128,31 @@ static void enforce_max_heatcool_subcycle_dt_(
 
 // -------------------------------------------------------------
 
-/// Set up the masks (and `imp_eng`) that identify the schemes that will be
-/// used to evolve the chemistry network
-///
-/// There are 2 schemes:
-///   1. Gauss-Seidel (for low-density zones)
-///   2. Newton-Raphson (for high-density zones) in 2 modes:
-///      - internal energy evolution is operator-split (handled separately from
-///        chemistry network)
-///      - internal energy is coupled with the rest of the chemistry network
-///
-/// @param[in]  idx_range Specifies the current index-range
-/// @param[in]  itmask Specifies all locations to be evolved
-///     during the current subcycle (in `idx_range`).
-/// @param[out] itmask_gs Buffer for `idx_range` that is used to specify
-///     locations where we will apply Gauss-Seidel scheme
-/// @param[out] itmask_nr Buffer for `idx_range` that is used to specify
-///     locations where we will apply Newton-Raphson scheme
-/// @param[out] imp_eng Buffer for `idx_range` where the choice of
-///     energy-evolution handling is recorded for the Newton-Raphson scheme
-/// @param[in]  mask_len the length of the iteration masks
-/// @param[in]  min_metallicity specifies the minimum metallicity where we
-///     consider metal chemistry/cooling
-/// @param[in]  ddom specifies precomputed product of mass density and the
-///    `dom` quantity for each location in `idx_range`
-/// @param[in]  tgas specifies the gas temperatures for the `idx_range`
-/// @param[in]  metallicity specifies the metallicity for the `idx_range`
+/// Select a scheme from the local thermal relaxation timescale instead of
+/// density/temperature thresholds. A fixed-composition derivative is required:
+/// a secant across subcycles mixes chemistry changes into the thermal slope.
+/// Repeated heating/cooling sign changes also promote cells to NR. Positive
+/// thermal slopes are accuracy-limited in both schemes.
 static void setup_chem_scheme_masks_(
-  GRIMPL_NS::IndexRange idx_range, const gr_mask_type* itmask,
-  gr_mask_type* itmask_gs, gr_mask_type* itmask_nr, int* imp_eng, int mask_len,
-  double min_metallicity, const double* ddom, const double* tgas,
-  const double* metallicity, const chemistry_data* my_chemistry
+  IndexRange idx_range, const gr_mask_type* itmask,
+  gr_mask_type* itmask_gs, gr_mask_type* itmask_nr, int* imp_eng,
+  const double* thermal_slope, const int* sign_flips,
+  const double* ttot, double dt,
+  const chemistry_data* chemistry
 ) {
-
-  std::memcpy(itmask_gs, itmask, sizeof(gr_mask_type)*mask_len);
-  std::memcpy(itmask_nr, itmask, sizeof(gr_mask_type)*mask_len);
-
-  // netwon-raphson solver can only coevolves energy when this is true
-  const bool has_nr_coevolve_eint_prereqs = (
-    (my_chemistry->with_radiative_cooling == 1) &&
-    (my_chemistry->primordial_chemistry > 1)
-  );
-
-  for (int i = idx_range.i_start; i < idx_range.i_stop; i++) {
-    if ( itmask[i] != MASK_FALSE )  {
-      bool usemetal = (my_chemistry->metal_cooling == 1) && (metallicity[i] > min_metallicity);
-      bool is_hi_dens;
-      if (my_chemistry->solver_method == 2) {
-        // Force Gauss-Seidel
-        is_hi_dens = false;
-      } else if (my_chemistry->solver_method == 3) {
-        // Force Newton-Raphson
-        is_hi_dens = true;
-      } else {
-        // Default
-        is_hi_dens = (ddom[i] >= 1.e8) || (usemetal && (ddom[i] >= 1.0e6));
-      }
-
-      itmask_gs[i] = (!is_hi_dens) ? MASK_TRUE : MASK_FALSE;
-      itmask_nr[i] = (is_hi_dens) ? MASK_TRUE : MASK_FALSE;
-
-      // when true, the newton-raphson scheme coevolves internal-energy
-      // alongside chemistry
-      bool nr_coevolve_energy = (
-        has_nr_coevolve_eint_prereqs && (ddom[i] > 1.e7) && (tgas[i] > 1650.0)
-      );
-      // we don't care about imp_eng[i] where itmask_nr[i] == MASK_FALSE
-      imp_eng[i] = (nr_coevolve_energy) ? 1 : 0;
-    }
+  for (int i = idx_range.i_start; i < idx_range.i_stop; ++i) {
+    const bool active = itmask[i] != MASK_FALSE;
+    const double remaining = dt - ttot[i];
+    const bool stiff_thermal = chemistry->with_radiative_cooling == 1 &&
+        thermal_slope[i] < 0. && remaining * (-thermal_slope[i]) > 1.;
+    const bool has_equations = chemistry->primordial_chemistry > 0 ||
+        chemistry->with_radiative_cooling == 1;
+    const bool use_nr = active && has_equations && chemistry->solver_method != 2 &&
+        (chemistry->solver_method == 3 || stiff_thermal || sign_flips[i] >= 2);
+    itmask_nr[i] = use_nr ? MASK_TRUE : MASK_FALSE;
+    itmask_gs[i] = active && !use_nr ? MASK_TRUE : MASK_FALSE;
+    imp_eng[i] = use_nr && chemistry->with_radiative_cooling == 1 ? 1 : 0;
   }
-
 }
 
 // -------------------------------------------------------------
@@ -469,7 +427,6 @@ static void set_subcycle_dt_from_chemistry_scheme_(
       // Part 2 of 2: compute minimum rate timestep
       // ------------------------------------------
 
-      double olddtit = dtit[i];
       dtit[i] = grackle::impl::fmin(std::fabs(0.1*de(i,j,k)/dedot[i]),
                                     std::fabs(0.1*HI(i,j,k)/HIdot[i]),
                                     dt-ttot[i],
@@ -489,17 +446,14 @@ static void set_subcycle_dt_from_chemistry_scheme_(
         dtit[i] = std::fmin(dtit[i], 0.1*Heq_div_dHeqdt);
       }
 
-      if (iter > 10) {
-        dtit[i] = std::fmin(olddtit*1.5, dtit[i]);
-      }
 
     } else if ((itmask_nr[i]!=MASK_FALSE) && (imp_eng[i]==0))  {
       // we may want to handle this case and the next case in a separate
       // function (they determine the timestep using very different logic than
       // in the above case)
-      dtit[i] = grackle::impl::fmin(std::fabs(0.1*e(i,j,k)/edot[i]*d(i,j,k)),
-                                    dt-ttot[i],
-                                    0.5*dt);
+      // Energy is frozen in this mode: a cooling timescale must not constrain
+      // a chemistry-only step. The adaptive NR controller limits its accuracy.
+      dtit[i] = dt - ttot[i];
 
     } else if ((itmask_nr[i]!=MASK_FALSE) && (imp_eng[i]==1))  {
       dtit[i] = dt - ttot[i];
@@ -679,6 +633,8 @@ int solve_rate_cool(
   grackle_field_data* my_fields, photo_rate_storage* my_uvb_rates
 )
 {
+  if (dt == 0.) return GR_SUCCESS;
+  if (!std::isfinite(dt) || dt < 0.) return GR_FAIL;
 
 #ifdef GRACKLE_FLOAT_4
   const gr_float tolerance = (gr_float)(1.0e-05);
@@ -788,6 +744,20 @@ int solve_rate_cool(
     // of the e_density field
     std::vector<double> nelec_times_mH(my_fields->grid_dimension[0]);
     std::vector<double> edot(my_fields->grid_dimension[0]);
+    std::vector<double> thermal_slope(my_fields->grid_dimension[0]);
+    std::vector<double> previous_edot(my_fields->grid_dimension[0]);
+    std::vector<double> next_nr_dt(my_fields->grid_dimension[0]);
+    std::vector<double> minimum_dt(my_fields->grid_dimension[0]);
+    std::vector<int> sign_flips(my_fields->grid_dimension[0]);
+    // Allocate this relatively large scratch workspace only for calculations
+    // that evolve energy, and reuse it throughout the worker's rows.
+    std::unique_ptr<ThermalSlopeProbe> thermal_probe;
+    if (my_chemistry->with_radiative_cooling == 1 &&
+        my_chemistry->solver_method != 3) {
+      thermal_probe.reset(new ThermalSlopeProbe({dom, chunit, dx_cgs, c_ljeans,
+        anydust, my_chemistry, my_rates, *my_uvb_rates, internalu},
+        my_fields->grid_dimension[0]));
+    }
 
     // iteration masks
     std::vector<gr_mask_type> itmask(my_fields->grid_dimension[0]);
@@ -841,6 +811,10 @@ int solve_rate_cool(
 
       for (int i = idx_range.i_start; i < idx_range.i_stop; i++) {
         ttot[i] = 0.;
+        next_nr_dt[i] = std::numeric_limits<double>::infinity();
+        previous_edot[i] = 0.;
+        thermal_slope[i] = 0.;
+        sign_flips[i] = 0;
       }
 
       // A useful slice variable since we do this a lot
@@ -953,17 +927,33 @@ int solve_rate_cool(
             spsolvbuf.chemheatrates_buf, spsolvbuf.rxn_rate_buf
           );
 
-          // Setup masks to identify which chemistry schemes to use. We split
-          // cells by density:
-          //    => low-density: Gauss-Seidel scheme, tracked by itmask_gs
-          //    => high-density: Newton-Raphson scheme, tracked by itmask_nr
-          setup_chem_scheme_masks_(
-            idx_range, itmask.data(), spsolvbuf.itmask_gs, spsolvbuf.itmask_nr,
-            spsolvbuf.imp_eng, my_fields->grid_dimension[0],
-            min_metallicity, spsolvbuf.ddom, tgas.data(), metallicity.data(),
-            my_chemistry
-          );
+        }
 
+        for (int i = idx_range.i_start; i < idx_range.i_stop; ++i) {
+          if (itmask[i] == MASK_FALSE) continue;
+          const bool flipped = edot[i] != 0. && previous_edot[i] != 0. &&
+              std::signbit(edot[i]) != std::signbit(previous_edot[i]);
+          sign_flips[i] = flipped ? sign_flips[i] + 1 : 0;
+          previous_edot[i] = edot[i];
+          minimum_dt[i] = std::nextafter(ttot[i],
+              std::numeric_limits<double>::infinity()) - ttot[i];
+        }
+        const bool probe_ok = !thermal_probe || thermal_probe->evaluate(
+            my_fields, idx_range, itmask.data(), thermal_slope.data());
+        if (!probe_ok) {
+          OMP_PRAGMA_CRITICAL
+          {
+            eprintf("Non-finite thermal derivative in solve_rate_cool\n");
+            ierr = GR_FAIL;
+          }
+          break;
+        }
+        setup_chem_scheme_masks_(idx_range, itmask.data(), spsolvbuf.itmask_gs,
+          spsolvbuf.itmask_nr, spsolvbuf.imp_eng, thermal_slope.data(),
+          sign_flips.data(), ttot.data(), dt,
+          my_chemistry);
+
+        if (my_chemistry->primordial_chemistry > 0) {
           // Set the max timestep for the current subcycle based on our scheme
           // for updating the chemical network:
           // - for Gauss-Seidel, pick a timestep that keeps relative chemical
@@ -981,17 +971,65 @@ int solve_rate_cool(
           );
         }
 
-        const gr_mask_type* energy_itmask =
-          (my_chemistry->primordial_chemistry == 0)
-          ? itmask.data() : spsolvbuf.itmask_gs;
+        const gr_mask_type* energy_itmask = spsolvbuf.itmask_gs;
+        if (my_chemistry->primordial_chemistry == 0) {
+          for (int i = idx_range.i_start; i < idx_range.i_stop; ++i) {
+            dtit[i] = dt - ttot[i];
+          }
+        }
 
         // Update dtit (the current subcycle timestep) to ensure it doesn't
         // exceed the max timestep for cooling/heating
         // -> zones that will use Newton-Raphson scheme are ignored
-        enforce_max_heatcool_subcycle_dt_(
-          dtit.data(), idx_range, dt, ttot.data(), energy_itmask, tgas.data(),
-          edot.data(), my_chemistry, my_fields
-        );
+        if (my_chemistry->with_radiative_cooling == 1) {
+          enforce_max_heatcool_subcycle_dt_(
+            dtit.data(), idx_range, dt, ttot.data(), energy_itmask, tgas.data(),
+            edot.data(), my_chemistry, my_fields);
+          for (int i = idx_range.i_start; i < idx_range.i_stop; ++i) {
+            if (itmask[i] != MASK_FALSE && thermal_slope[i] > 0.) {
+              dtit[i] = std::fmin(dtit[i], 0.1 / thermal_slope[i]);
+            }
+          }
+        }
+
+        // Retain the adaptive controller's successful proposal between
+        // subcycles instead of retrying the entire remaining time each time.
+        for (int i = idx_range.i_start; i < idx_range.i_stop; ++i) {
+          if (spsolvbuf.itmask_nr[i] != MASK_FALSE) {
+            dtit[i] = std::fmin(dtit[i], next_nr_dt[i]);
+          } else {
+            next_nr_dt[i] = std::numeric_limits<double>::infinity();
+          }
+        }
+
+        // Check every active step before any species or energy update.
+        // A non-finite step must not be hidden by fmin when time is advanced.
+        bool valid_step = true;
+        for (int i = idx_range.i_start; i < idx_range.i_stop; ++i) {
+          if (itmask[i] == MASK_FALSE) continue;
+          if (!(std::isfinite(dtit[i]) && dtit[i] > 0. &&
+                dtit[i] >= minimum_dt[i])) {
+            valid_step = false;
+            break;
+          }
+          if (my_chemistry->with_radiative_cooling == 1 &&
+              energy_itmask[i] != MASK_FALSE) {
+            const gr_float next_energy = e(i,j,k) +
+                static_cast<gr_float>(edot[i] / d(i,j,k) * dtit[i]);
+            if (!(std::isfinite(next_energy) && next_energy > 0.)) {
+              valid_step = false;
+              break;
+            }
+          }
+        }
+        if (!valid_step) {
+          OMP_PRAGMA_CRITICAL
+          {
+            eprintf("Non-finite state or non-progressing step in solve_rate_cool\n");
+            ierr = GR_FAIL;
+          }
+          break;
+        }
 
         // Update total and gas energy
         // -> zones that will use Newton-Raphson scheme are ignored
@@ -1015,21 +1053,26 @@ int solve_rate_cool(
             species_tmpdens, spsolvbuf.rxn_rate_buf
           );
 
-          // Solve rate equations with one linearly implicit Gauss-Seidel
-          // sweep of a backward Euler method (for all cells specified by
-          // itmask_nr)
-          grackle::impl::step_rate_newton_raphson(
+        }
+
+        // This also handles primordial_chemistry == 0 as a scalar energy ODE.
+        const bool nr_ok = grackle::impl::step_rate_newton_raphson(
             idx_range, dom, chunit, dx_cgs, c_ljeans,
-            dtit.data(), tgas.data(), tdust.data(),
+            dtit.data(), minimum_dt.data(), next_nr_dt.data(),
+            tgas.data(), tdust.data(),
             metallicity.data(), dust2gas.data(), rhoH.data(), mmw.data(),
             nelec_times_mH.data(), edot.data(), anydust, spsolvbuf.itmask_nr,
             itmask_metal.data(), spsolvbuf.imp_eng, my_chemistry, my_rates,
             my_fields, *my_uvb_rates, internalu, grain_temperatures,
-            logTlininterp_buf, coolingheating_buf, spsolvbuf.chemheatrates_buf
-          );
-
+            logTlininterp_buf, coolingheating_buf, spsolvbuf.chemheatrates_buf);
+        if (!nr_ok) {
+          OMP_PRAGMA_CRITICAL
+          {
+            eprintf("Adaptive Newton-Raphson step failed in solve_rate_cool\n");
+            ierr = GR_FAIL;
+          }
+          break;
         }
-
         // Add the timestep to the elapsed time for each cell and find
         //  minimum elapsed time step in this row
         ttmin = huge8;
@@ -1098,12 +1141,7 @@ int solve_rate_cool(
 
   }  // OMP_PRAGMA("omp parallel")
 
-  // If an error has been produced, return now.
-
-  if (ierr != GR_SUCCESS)  {
-    return ierr;
-  }
-
+  // Restore user density units on both success and failure.
   // Convert densities back to comoving from proper
 
   if (internalu.extfields_in_comoving == 1)  {
@@ -1112,6 +1150,8 @@ int solve_rate_cool(
         factor, my_chemistry, my_fields,
         grackle::impl::get_n_inject_pathway_density_ptrs(my_rates));
   }
+
+  if (ierr != GR_SUCCESS) return ierr;
 
   if (my_chemistry->primordial_chemistry > 0)  {
 

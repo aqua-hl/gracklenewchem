@@ -160,7 +160,9 @@ public:  // public API
                                            const Fn& calc_f_and_jacobian, int n,
                                            double* scratch_ptr,
                                            bool enforce_positive_non_NaN,
-                                           double local_density = 1.0) const {
+                                           double local_density = 1.0,
+                                           const double* absolute_tolerance = nullptr,
+                                           bool allow_zero = false) const {
     // I suspect that this practice of creating local buffers from a scratch
     // buffer is a useful idiom that we'll want to repeat
     int scratch_offset = 0;
@@ -185,6 +187,19 @@ public:  // public API
       // evaluate f(yₑ,ₖ) and the jacobian matrix for f at yₑ,ₖ.
       calc_f_and_jacobian(y, f, jacobian_f);
 
+      // A NaN correction otherwise looks converged because fmax ignores NaN.
+      // Never pass non-finite coefficients to the linear solve.
+      for (int i = 0; i < n; i++) {
+        if (!std::isfinite(f[i])) {
+          return IntegrateResult{TerminateFlag::OTHER_ERR, k};
+        }
+        for (int j = 0; j < n; j++) {
+          if (!std::isfinite(jacobian_f(i, j))) {
+            return IntegrateResult{TerminateFlag::OTHER_ERR, k};
+          }
+        }
+      }
+
       // store the value of (I - h * J_f(yₑ,ₖ)) inside mtrx
       // -> I is the identity matrix and J_f is the jacobian matrix for f
       //    evaluated at the current guess for yₑ.
@@ -207,9 +222,33 @@ public:  // public API
         vec[i] = f[i] * h - ycur_minus_ystart[i];
       }
 
-      // to get more accuracy  (TODO: shouldn't be part of this fn)
-      for (int i = 0; i < n; i++) {
-        vec[i] = vec[i] / local_density;
+      // Balance the equations and unknowns when component tolerances supply
+      // their natural scales. Energy and species densities can differ by
+      // many decades in code units; a common density factor does not fix
+      // that conditioning. The RHS buffer is now free to hold the scales.
+      if (absolute_tolerance != nullptr) {
+        for (int i = 0; i < n; i++) {
+          f[i] = std::fmax(std::fabs(y[i]),
+                          absolute_tolerance[i] / max_rtol_);
+          if (f[i] == 0.) { f[i] = 1.; }
+          if (!std::isfinite(f[i]) || f[i] < 0.) {
+            return IntegrateResult{TerminateFlag::OTHER_ERR, k};
+          }
+        }
+        for (int i = 0; i < n; i++) {
+          vec[i] /= f[i];
+          for (int j = 0; j < n; j++) {
+            mtrx(i, j) *= f[j] / f[i];
+            if (!std::isfinite(mtrx(i, j))) {
+              return IntegrateResult{TerminateFlag::OTHER_ERR, k};
+            }
+          }
+        }
+      } else {
+        // Preserve the historical scaling for existing callers.
+        for (int i = 0; i < n; i++) {
+          vec[i] = vec[i] / local_density;
+        }
       }
 
       // compute  δₖ = (I - h * J_f(yₑ,ₖ))⁻¹ ⋅ (h * f(yₑ,ₖ) - (yₑ,ₖ - yₛ))
@@ -232,9 +271,9 @@ public:  // public API
         return IntegrateResult{TerminateFlag::OTHER_ERR, k};
       }
 
-      // multiply with density again  (TODO: shouldn't be part of this fn)
+      // Convert the scaled correction back to each component's own units.
       for (int i = 0; i < n; i++) {
-        vec[i] = vec[i] * local_density;
+        vec[i] *= (absolute_tolerance != nullptr) ? f[i] : local_density;
       }
 
       // update values in ycur_minus_ystart and y for next iteration using:
@@ -245,9 +284,11 @@ public:  // public API
         y[i] = y[i] + vec[i];
       }
 
-      if (enforce_positive_non_NaN) {
+      {
         for (int i = 0; i < n; i++) {
-          if (std::isnan(y[i]) || (y[i] <= 0.)) {
+          const bool invalid_sign = enforce_positive_non_NaN &&
+            ((allow_zero && y[i] < 0.) || (!allow_zero && y[i] <= 0.));
+          if (!std::isfinite(y[i]) || !std::isfinite(vec[i]) || invalid_sign) {
             // a compelling case could be made for saying there are k+1 complete
             // iterations, but saying there are k iterations is probably more
             // useful for identifying underlying issues
@@ -259,9 +300,18 @@ public:  // public API
       double max_rel_diff_mag = 0.0;
       for (int i = 0; i < n; i++) {
         double cur = y[i];
-        // todo: double check that our behavior, when cur ~ 0, makes sense
         // reminder: at this point, vec holds δₖ = yₑ,ₖ₊₁ - yₑ,ₖ
-        double err = (cur > tiny8) ? std::fabs(vec[i] / cur) : 0.0;
+        double err;
+        if (absolute_tolerance != nullptr) {
+          // An abundance-aware absolute tolerance prevents absent species
+          // from making the relative convergence test singular.
+          double scale = std::fabs(cur) + absolute_tolerance[i] / max_rtol_;
+          err = (scale > 0.) ? std::fabs(vec[i]) / scale
+                            : (vec[i] == 0. ? 0. : HUGE_VAL);
+        } else {
+          // Bound the scale near zero without ignoring a nonzero correction.
+          err = std::fabs(vec[i]) / std::fmax(std::fabs(cur), tiny8);
+        }
         max_rel_diff_mag = std::fmax(err, max_rel_diff_mag);
       }
 

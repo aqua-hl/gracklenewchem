@@ -243,7 +243,7 @@ inline void step_rate_gauss_seidel(
   grackle::impl::SpeciesCollection species_tmpdens,
   const FullRxnRateBuf rxn_rate_buf
 ) {
-  View<gr_float**> species_tmpdens_view(species_tmpdens.data[0],
+  View<double**> species_tmpdens_view(species_tmpdens.data[0],
                                         MAX_EVOLVED_SPECIES_FIELDS,
                                         my_fields->grid_dimension[0]);
 

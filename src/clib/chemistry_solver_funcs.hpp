@@ -168,7 +168,7 @@ public:
 ///   maybe even primordial_chemistry == 3 (but, we'll obviously need to test
 ///   performance).
 inline void species_density_updates_gauss_seidel(
-  View<gr_float**> out_spdens, IndexRange idx_range,
+  View<double**> out_spdens, IndexRange idx_range,
   const double* dtit, gr_mask_type anydust, const double* rhoH,
   const gr_mask_type* itmask, const gr_mask_type* itmask_metal,
   const chemistry_data* my_chemistry, grackle_field_data* my_fields,
@@ -610,6 +610,11 @@ inline void species_density_updates_gauss_seidel(
                 +  kcol_buf[CollisionalRxnLUT::k14][i]*HM[i]
                 -  kcol_buf[CollisionalRxnLUT::k7][i] *HI[i]
                 -  kcol_buf[CollisionalRxnLUT::k18][i]*H2II[i]/2.);
+        // D photoionization uses k24 like HI and releases one electron
+        // per D atom. DI stores twice its number density in mass units.
+        if (my_chemistry->primordial_chemistry > 2) {
+          scoef += kph_buf[PhotoRxnLUT::k24][i] * DI[i] / 2.;
+        }
 #ifdef CONTRIBUTION_OF_MINOR_SPECIES
         if (my_chemistry->primordial_chemistry > 2)  {
           scoef = scoef
@@ -1968,7 +1973,9 @@ inline void species_density_derivatives_0d(
     // contribution of minor species
     if (my_chemistry->primordial_chemistry > 2)  {
       scoef = scoef
-            + kcol_buf[CollisionalRxnLUT::k56][0]    * DI         * HM        / 2.;
+            + kcol_buf[CollisionalRxnLUT::k56][0]    * DI         * HM        / 2.
+            // D + photon -> D+ + e; DI is a mass-density field.
+            + kph_buf[PhotoRxnLUT::k24][0]          * DI                   / 2.;
       acoef = acoef
             - kcol_buf[CollisionalRxnLUT::k1][0]     * DI         / 2.
             + kcol_buf[CollisionalRxnLUT::k2][0]     * DII        / 2.;

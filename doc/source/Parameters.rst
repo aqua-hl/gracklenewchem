@@ -617,6 +617,41 @@ For all on/off integer flags, 0 is off and 1 is on.
    On/off flag to toggle calculation of rate coefficients corresponding to bremsstrahlung cooling 
    (``brem``). Default: 1
 
+.. c:var:: int solver_method
+
+   Selects the chemistry and energy integration scheme. Default: 1.
+
+   * 1: use Gauss-Seidel for non-stiff cells and adaptive Newton-Raphson
+     for stiff thermal relaxation or repeated heating/cooling sign changes.
+     Selection is made separately for
+     each cell and subcycle; it does not use density/temperature thresholds.
+   * 2: use Gauss-Seidel only.
+   * 3: use adaptive Newton-Raphson only.
+
+   Newton-Raphson couples the internal energy to the active species whenever
+   :c:data:`with_radiative_cooling` is enabled. With
+   :c:data:`primordial_chemistry` equal to 0 it solves a scalar energy equation;
+   with cooling disabled it evolves chemistry without a cooling timestep cap.
+
+   Adaptive steps compare one backward-Euler step with two half steps and
+   accept the latter. The relative error tolerance is 0.001. Species have an
+   additional absolute tolerance of ``1e-13 * density`` in code units, and
+   accepted changes are limited to 10 percent relative to the initial value
+   or a trace-abundance scale of ``1e-10 * density``. These controls are local
+   timestep criteria, not a bound on the global integration error.
+
+   The thermal derivative is evaluated with species held fixed. For a positive
+   derivative, the timestep resolves its growth timescale instead of damping
+   an unstable thermal equilibrium. This guard checks the thermal mode; it
+   does not determine the stability of every coupled chemothermal mode.
+
+   Newton failures and rejected accuracy/stability trials shorten the step.
+   Retries are bounded and cannot pass the floating-point progress limit.
+   If no acceptable step is found, :c:func:`solve_chemistry` returns failure
+   independently of :c:data:`exit_after_iterations_exceeded`. Rejected trials
+   do not commit field changes; earlier cells and accepted subcycles may
+   already have advanced. Density units are restored before returning failure.
+
 .. c:var:: int max_iterations
 
    The maximum subcycle iterations allowed when evolving the chemistry

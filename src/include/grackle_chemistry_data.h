@@ -292,10 +292,10 @@ typedef struct
   /* number of OpenMP threads, if supported */
   int omp_nthreads;
 
-   /* solver to be used 
-   * 1: Gauss-Seidel-Newton-Raphson
+   /* solver to be used
+   * 1: stiffness-selected Gauss-Seidel / adaptive Newton-Raphson
    * 2: Gauss-Seidel-only
-   * 3: Newton-Raphson-only
+   * 3: adaptive Newton-Raphson-only (coupled energy when cooling is enabled)
    */
   int solver_method;
 

@@ -16,6 +16,9 @@
 #ifndef STEP_RATE_NEWTON_RAPHSON_HPP
 #define STEP_RATE_NEWTON_RAPHSON_HPP
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <vector>
 
 #include "grackle.h"             // gr_float
@@ -24,7 +27,7 @@
 #include "inject_model/grain_metal_inject_pathways.hpp"
 #include "internal_types.hpp"
 #include "internal_units.hpp"
-#include "math/integrate.hpp"
+#include "math/adaptive_integrate.hpp"
 #include "opaque_storage.hpp"
 #include "support/View.hpp"
 #include "support/config.hpp"
@@ -147,17 +150,18 @@ inline void wrapped_calc_derivatives(
 /// Whereas the Gauss-Seidel scheme always operator-splits evolution of the
 /// energy equation, this function internally evolves the energy equation
 ///
-/// @note
-/// The values in the various buffers (tgas, tdust, metallicity, dust2gas,
-/// rhoH, mmw, edot, grain_temperatures, logTlininterp_buf,
-/// coolingheating_buf, chemheatrates_buf), hold undefined
-/// values after this function call wherever `itmask_nr` indicates that this
-/// function runs.
-/// - this has **ALWAYS** been the case. Historically these buffers have been
-///   reused when computing finite differences
-inline void step_rate_newton_raphson(
+/// Each selected cell advances one accepted substep, whose duration is written
+/// to dtit. Scratch buffers are refreshed at the accepted state.
+///
+/// @param minimum_subcycle_dt The smallest interval that advances each cell's
+/// accumulated elapsed time in floating-point arithmetic.
+/// @return false on bounded integration failure. The failing cell retains its
+/// original fields; earlier accepted cells in this row remain advanced.
+inline bool step_rate_newton_raphson(
     IndexRange idx_range, double dom, double chunit, double dx_cgs,
-    double c_ljeans, double* dtit, double* tgas, double* tdust,
+    double c_ljeans, double* dtit, const double* minimum_subcycle_dt,
+    double* next_nr_dt,
+    double* tgas, double* tdust,
     double* metallicity, double* dust2gas, double* rhoH, double* mmw,
     double* nelec_times_mH, double* edot, gr_mask_type anydust,
     const gr_mask_type* itmask_nr, const gr_mask_type* itmask_metal,
@@ -170,6 +174,13 @@ inline void step_rate_newton_raphson(
     grackle::impl::ChemHeatingRates chemheatrates_buf) {
   // shorten `grackle::impl::time_deriv_0d` to `t_deriv` within this function
   namespace t_deriv = ::grackle::impl::time_deriv_0d;
+
+  // The Gauss-Seidel fast path must not allocate Newton workspaces.
+  bool any_nr_cells = false;
+  for (int i = idx_range.i_start; i < idx_range.i_stop; ++i) {
+    any_nr_cells = any_nr_cells || (itmask_nr[i] != MASK_FALSE);
+  }
+  if (!any_nr_cells) return true;
 
   // the following is a quick sanity check
   // -> we can remove this once we finish transcribing lookup_cool_rate0d
@@ -199,22 +210,27 @@ inline void step_rate_newton_raphson(
   std::vector<double> full_dsp_buf(i_eng);
   std::vector<double> full_dspdot_buf(i_eng);
   std::vector<double> full_dspdot_buf1(i_eng);
+  std::vector<double> absolute_tolerance(i_eng);
 
-  // initialize the ode_solver
-  // -> a solution is considered converged when the max relative difference
-  //    magnitude of any vector component does not exceed this value
-  double max_rtol = 1.e-8;
-  // -> maximum number of iterations before giving up on a provided timestep
-  int maxiter_per_dt = 20;
-  integrate::StiffNewtonRaphson ode_solver(i_eng, max_rtol, maxiter_per_dt);
+  // Error control is independent of the nonlinear-solve tolerance. A
+  // successful step uses two backward-Euler half steps and advances only
+  // the accepted interval, with bounded retries and thermal stability guards.
+  constexpr double relative_tolerance = 1.e-3;
+  // The RHS evaluates gr_float fields, even though Newton iterates in double.
+  // Its convergence tolerance must therefore accommodate field roundoff.
+  constexpr double nonlinear_tolerance = std::max(
+    1.e-8, 32.*std::numeric_limits<gr_float>::epsilon());
+  integrate::AdaptiveBackwardEuler ode_solver(
+    i_eng, relative_tolerance, 0.1, 40, nonlinear_tolerance);
 
   std::vector<double> ode_scratch_buf(ode_solver.num_scratch_buf_elements());
 
   // (In the future, we may want to reconsider when/how we allocate
   // the following 3 variables)
   std::vector<int> idsp;
-  // Another parameter
-  const double eps = 1.e-4;
+  // Resolve finite differences above the precision of the RHS fields.
+  constexpr double eps = (std::numeric_limits<gr_float>::digits <
+                          std::numeric_limits<double>::digits) ? 1.e-2 : 1.e-4;
 
   // allocate some scratch buffers. In the future, when we refactor to support
   // calculations of the time derivatives of multiple values at once, we should
@@ -243,12 +259,10 @@ inline void step_rate_newton_raphson(
   grackle::impl::SpeciesCollection rhosp_dot =
     grackle::impl::new_SpeciesCollection(1);
 
-  // the following check was inspired by a compiler warning indicating that
-  // nsp won't be initialized if this condition isn't met
-  GRIMPL_REQUIRE((my_chemistry->primordial_chemistry > 0),
-    "this function can't support primordial_chemistry == %d",
-    my_chemistry->primordial_chemistry
-  );
+  auto release_scratch = [&]() {
+    t_deriv::drop_MainScratchBuf(&main_scratch_buf);
+    grackle::impl::drop_SpeciesCollection(&rhosp_dot);
+  };
 
   // The following was extracted from another subroutine
   for (int i = idx_range.i_start; i < idx_range.i_stop; i++) {
@@ -262,17 +276,14 @@ inline void step_rate_newton_raphson(
 
     if (itmask_nr[i] != MASK_FALSE)  {
 
-      // If density and temperature are low, update gas energy explicitly
-
-      if (my_chemistry->with_radiative_cooling == 1)  {
-        if (imp_eng[i] == 0)  {
-          e(i,j,k)  = e(i,j,k) +
-               (gr_float)(edot[i]/d(i,j,k)*dtit[i] );
-        }
-      }
+      // Every trial starts from the original state. In particular, a
+      // rejected Newton step must not leave a speculative energy update.
+      std::fill(dsp.begin(), dsp.end(), 0.0);
+      const double initial_energy = e(i,j,k);
+      const double initial_energy_derivative = edot[i] / d(i,j,k);
 
       // initialize arrays
-      nsp = 6; // (my_chemistry->primordial_chemistry >= 1)
+      nsp = (my_chemistry->primordial_chemistry > 0) ? 6 : 0;
       if (my_chemistry->primordial_chemistry > 1) { nsp = nsp + 3; }
       if (my_chemistry->primordial_chemistry > 2) { nsp = nsp + 3; }
       if (my_chemistry->primordial_chemistry > 3) { nsp = nsp + 3; }
@@ -291,6 +302,7 @@ inline void step_rate_newton_raphson(
         }
       }
       nsp = nsp + imp_eng[i];
+      if (nsp == 0) continue; // no chemistry and no energy evolution
       idsp.resize(nsp);
 
       // copy values into dsp from my_fields
@@ -472,26 +484,9 @@ inline void step_rate_newton_raphson(
 
       GRIMPL_REQUIRE((id == nsp), "SANITY CHECK FAILED");
 
-      // setup the dt_FIXME variable (this obviously needs some attention)
-      // -> as in solve_rate_cool_g, dt represents the total timestep that we
-      //    are evolving the system of equations over
-      // -> here, we are saying defining dt as a reference to the current
-      //    subcycle timestep at the current zone (we define it as a
-      //    reference because it needs to match the value of dtit[i] if we
-      //    choose to modify it)
-      // -> This sure seems inconsistent!
-      // -> OK, in more detail:
-      //    -> the only purpose of this variable is to be passed into the
-      //       time-derivative calculation.
-      //    -> within the time derivative calculation, the variable is ONLY
-      //       used as an argument forwarded to the `dt` argument of
-      //       lookup_cool_rates1d_g
-      //    -> at present, the other callsite of `lookup_cool_rates1d_g`
-      //       passes in the total timestep to dt
-      //    -> for now, we're just going to maintain compatability but this
-      //       NEEDS to be addressed (see the C++ docstring of
-      //       `lookup_cool_rates1d_g` for more discussion). We actually have
-      //       been doing things correctly here and incorrectly elsewhere
+      // The legacy derivative API still accepts a timestep, although the
+      // current rates are functions of state alone. Keep a reference so this
+      // compatibility argument reflects the accepted duration after adaptation.
       double& dt_FIXME = dtit[i];
 
       // configure pack for use during the current index
@@ -552,7 +547,7 @@ inline void step_rate_newton_raphson(
       // Important: index `i` in these buffers correspond to the `i`th variable
       //            being evolved in the current timestep. The corresponding
       //            entry in `dsp` is at the index `idsp[isp]`.
-      const auto calc_f_and_jacobian = [&, dt_FIXME](
+      const auto calc_f_and_jacobian = [&](
           const double* reduced_dsp, double* reduced_dspdot,
           View<double**>& jacobian) -> void {
 
@@ -576,10 +571,26 @@ inline void step_rate_newton_raphson(
         //    partial derivative for each evolved variable (i.e. the species
         //    densities and possibly the total energy)
         for (int jsp = 0; jsp < nsp; jsp++) {
-          double dspj = eps * reduced_dsp[jsp];
+          // Zero and trace abundances need a nonzero, density-scaled
+          // perturbation. Use the actual representable difference below.
+          const bool energy_column = (idsp[jsp] == i_eng-1);
+          const double scale_floor = energy_column
+            ? std::max(std::fabs(initial_energy)*1.e-12, double{tiny8})
+            : std::max(double{d(i,j,k)}*1.e-10, double{tiny8});
+          const double base = static_cast<double>(
+            static_cast<gr_float>(reduced_dsp[jsp]));
+          double perturbed = base +
+            eps*std::max(std::fabs(base), scale_floor);
+          perturbed = static_cast<double>(static_cast<gr_float>(perturbed));
+          if (perturbed == base) {
+            perturbed = std::nextafter(
+              static_cast<gr_float>(base),
+              std::numeric_limits<gr_float>::infinity());
+          }
+          const double dspj = perturbed - base;
           for (int isp = 0; isp < nsp; isp++) {
             if (isp == jsp) {
-              full_dsp_buf[idsp[isp]] = reduced_dsp[isp] + dspj;
+              full_dsp_buf[idsp[isp]] = perturbed;
             } else {
               full_dsp_buf[idsp[isp]] = reduced_dsp[isp];
             }
@@ -592,60 +603,31 @@ inline void step_rate_newton_raphson(
           for (int isp = 0; isp < nsp; isp++) {
             double tderiv = full_dspdot_buf[idsp[isp]];
             double offset_tderiv = full_dspdot_buf1[idsp[isp]];
-            if ((reduced_dsp[isp] == 0.0) && (offset_tderiv == tderiv)) {
-              jacobian(isp, jsp) = 0.0;
-            } else {
-              jacobian(isp, jsp) = (offset_tderiv - tderiv) / dspj;
-            }
+            jacobian(isp, jsp) = (offset_tderiv - tderiv) / dspj;
           }
         }
       };
 
-      // iteratively try to evolve chemistry equations until answer converges
-      // -> First, we try to use the current timestep value tracked by dtit[i].
-      //    If the answer doesn't converge, we will try again with shorter and
-      //    shorter timesteps until chemistry converges
-      // -> when we exit this loop, reduced_dsp will hold the values of all of
-      //    the evolved variables
-      bool is_converged = false;
-      while (!is_converged) {
-
-        // copy values into reduced_dsp for variables that are being evolved
-        // (we need to do this each time we enter the loop since reduced_dsp
-        // is mutated in place as we try to evolve things)
-        for (int isp = 0; isp < nsp; isp++) {
-          reduced_dsp[isp] = dsp[idsp[isp]];
-        }
-
-        // Iteration to solve ODEs
-
-
-
-        const bool enforce_positive_non_NaN =
-      (imp_eng[i] == 1) && (my_chemistry->primordial_chemistry > 0) &&
-      (my_chemistry->with_radiative_cooling == 1);
-
-        integrate::IntegrateResult rslt = ode_solver.step(
-            reduced_dsp.data(), dtit[i], calc_f_and_jacobian, nsp,
-            ode_scratch_buf.data(), enforce_positive_non_NaN, d(i, j, k));
-        is_converged = rslt.converged();
-
-        // Check if the fractions are valid after an iteration
-        if( (my_chemistry->primordial_chemistry > 0)  &&  (my_chemistry->with_radiative_cooling == 1) )  {
-          for (isp = 0; isp<nsp; isp++) {
-            if ( std::isnan(reduced_dsp[isp]) || (reduced_dsp[isp] <= 0.) )  {
-              is_converged = false;
-            }
-          }
-        }
-
-        // cut the timestep in half for the next loop
-        // todo: handle worst case scenario (i.e. it never converging or no
-        //       converging unless timestep is 0)
-        if(!is_converged)  {
-          dtit[i] = 0.5 * dtit[i];
-        }
+      for (int isp = 0; isp < nsp; ++isp) {
+        reduced_dsp[isp] = dsp[idsp[isp]];
+        // The helper's fractional-change scale is atol / relative_tolerance.
+        absolute_tolerance[isp] = (idsp[isp] == i_eng-1)
+          ? relative_tolerance*std::max(std::fabs(initial_energy)*1.e-12,
+                                        double{tiny8})
+          : relative_tolerance*std::max(double{d(i,j,k)}*1.e-10,
+                                        double{tiny8});
       }
+      const int energy_index = (imp_eng[i] == 1) ? nsp-1 : -1;
+      const auto result = ode_solver.step(
+        reduced_dsp.data(), dtit[i], minimum_subcycle_dt[i],
+        calc_f_and_jacobian, nsp, energy_index, absolute_tolerance.data(),
+        ode_scratch_buf.data(), d(i,j,k));
+      if (!result.converged() || !std::isfinite(result.accepted_dt) ||
+          result.accepted_dt < minimum_subcycle_dt[i]) {
+        release_scratch();
+        return false;
+      }
+      dtit[i] = result.accepted_dt;
 
       // copy values from reduced_dsp back to dsp
       for (int isp = 0; isp < nsp; isp++) {
@@ -653,11 +635,36 @@ inline void step_rate_newton_raphson(
       } 
 
 
-      // overwrite the scratch-buffer values
-      // -> It makes no logical sense for us to do this, but we do it for the
-      //    sake of backwards compatability
-      // -> we should totally delete this function (we may already be able to
-      //    do so)
+      // Preserve the explicitly split mode without advancing energy by a
+      // rejected trial's longer interval. The hybrid normally couples energy.
+      if ((imp_eng[i] == 0) && (my_chemistry->with_radiative_cooling == 1)) {
+        dsp[i_eng-1] = initial_energy + initial_energy_derivative*dtit[i];
+      }
+      const gr_float accepted_energy = static_cast<gr_float>(dsp[i_eng-1]);
+      if (!std::isfinite(accepted_energy) || accepted_energy <= 0.) {
+        release_scratch();
+        return false;
+      }
+
+      for (int isp = 0; isp < nsp; ++isp) {
+        const double value = dsp[idsp[isp]];
+        if (!std::isfinite(value) || value < 0. ||
+            !std::isfinite(static_cast<gr_float>(value))) {
+          release_scratch();
+          return false;
+        }
+      }
+
+      // Finite-difference probes leave scratch buffers at a perturbed trial.
+      // Refresh them at the accepted state before returning them to the caller.
+      wrapped_calc_derivatives(dtit[i], dsp.data(), full_dspdot_buf.data(),
+                               pack, rhosp_grflt, rhosp_dot);
+      if (!std::isfinite(pack.other_scratch_buf.tgas[0]) ||
+          pack.other_scratch_buf.tgas[0] <= 0. ||
+          !std::isfinite(pack.other_scratch_buf.edot[0])) {
+        release_scratch();
+        return false;
+      }
       t_deriv::scratchbufs_copy_from_pack(
         i, &pack, tgas, tdust, metallicity, dust2gas, rhoH, mmw, nelec_times_mH,
         edot, grain_temperatures, logTlininterp_buf,
@@ -748,13 +755,14 @@ inline void step_rate_newton_raphson(
       }
 
       e(i,j,k)     = dsp[i_eng-1];
+      next_nr_dt[i] = result.suggested_dt;
 
       idsp.clear();
     }
   }
 
-  t_deriv::drop_MainScratchBuf(&main_scratch_buf);
-  grackle::impl::drop_SpeciesCollection(&rhosp_dot);
+  release_scratch();
+  return true;
 }
 
 } // namespace GRIMPL_NAMESPACE_DECL

@@ -20,6 +20,7 @@
 
 #include "gtest/gtest.h"
 #include "math/integrate.hpp"
+#include "math/adaptive_integrate.hpp"
 #include "support/View.hpp"
 
 static double L2_error_norm(const std::vector<double>& a,
@@ -277,4 +278,227 @@ TEST(IntegrateKapsProblem, dt1Div10) {
       << "integration failed for dt = " << dt;
   EXPECT_THAT(y, L2ErrorNormLT(ODESystem::analytic_solution(dt), 8.9e-3))
       << "for dt = " << dt;
+}
+
+namespace {
+
+template <typename Fn>
+GRIMPL_NS::integrate::AdaptiveIntegrateResult adaptive_step(
+    std::vector<double>& y, double dt, Fn& rhs, int energy_index = 0,
+    double relative_tolerance = 1.e-3, double max_change = 0.1,
+    double minimum_dt = 1.e-14, int max_retries = 40) {
+  GRIMPL_NS::integrate::AdaptiveBackwardEuler solver(
+    static_cast<int>(y.size()), relative_tolerance, max_change, max_retries);
+  std::vector<double> scratch(solver.num_scratch_buf_elements());
+  std::vector<double> absolute_tolerance(y.size(), 1.e-13);
+  return solver.step(y.data(), dt, minimum_dt, rhs,
+                     static_cast<int>(y.size()), energy_index,
+                     absolute_tolerance.data(), scratch.data());
+}
+
+struct ThermalMode {
+  double slope;
+  void operator()(const double* y, double* f,
+                  GRIMPL_NS::View<double**> jac) const {
+    f[0] = slope * (y[0] - 1.);
+    jac(0, 0) = slope;
+  }
+};
+
+}  // namespace
+
+TEST(StiffNewtonRaphson, ComponentScalingPreservesEquivalentUnits) {
+  // Coupled exchange conserves y[0] + y[1]/energy_unit. Code-unit choices
+  // can put the energy equation dozens of decades above the species equation.
+  for (double energy_unit : {1.e-35, 1., 1.e35}) {
+    auto rhs = [energy_unit](const double* y, double* f,
+                            GRIMPL_NS::View<double**> jac) {
+      f[0] = 1000. * (y[1] / energy_unit - y[0]);
+      f[1] = -energy_unit * f[0];
+      jac(0, 0) = -1000.;
+      jac(0, 1) = 1000. / energy_unit;
+      jac(1, 0) = 1000. * energy_unit;
+      jac(1, 1) = -1000.;
+    };
+    GRIMPL_NS::integrate::StiffNewtonRaphson solver(2, 1.e-10, 20);
+    std::vector<double> scratch(solver.num_scratch_buf_elements());
+    double y[] = {0.8, 0.2 * energy_unit};
+    double absolute_tolerance[] = {1.e-13, 1.e-13 * energy_unit};
+    const auto result = solver.step(y, 0.1, rhs, 2, scratch.data(), true,
+                                    1., absolute_tolerance, true);
+    ASSERT_TRUE(result.converged()) << "energy_unit=" << energy_unit;
+    EXPECT_NEAR(y[0], 0.5 + 0.3 / 201., 2.e-14);
+    EXPECT_NEAR(y[1] / energy_unit, 0.5 - 0.3 / 201., 2.e-14);
+    EXPECT_NEAR(y[0] + y[1] / energy_unit, 1., 2.e-14);
+  }
+}
+
+TEST(AdaptiveBackwardEuler, StableEquilibriumAllowsLargeStep) {
+  ThermalMode rhs{-1.};
+  std::vector<double> y{1.};
+  auto result = adaptive_step(y, 1.e20, rhs);
+  ASSERT_TRUE(result.converged());
+  EXPECT_EQ(result.accepted_dt, 1.e20);
+  EXPECT_EQ(y[0], 1.);
+  EXPECT_EQ(result.error_norm, 0.);
+}
+
+TEST(AdaptiveBackwardEuler, CachedProposalGrowsAfterTransient) {
+  ThermalMode rhs{-1.};
+  std::vector<double> y{1.3};
+  double elapsed = 0.;
+  double proposal = 1.e5;
+  bool grew = false;
+  int substeps = 0;
+  while (elapsed < 1.e5 && substeps < 200) {
+    const double requested = std::min(proposal, 1.e5 - elapsed);
+    auto result = adaptive_step(y, requested, rhs);
+    ASSERT_TRUE(result.converged());
+    grew = grew || result.suggested_dt > requested;
+    elapsed += result.accepted_dt;
+    proposal = result.suggested_dt;
+    ++substeps;
+  }
+  EXPECT_TRUE(grew);
+  EXPECT_LT(substeps, 200);
+  EXPECT_DOUBLE_EQ(elapsed, 1.e5);
+  EXPECT_NEAR(y[0], 1., 1.e-8);
+}
+
+TEST(AdaptiveBackwardEuler, StableRelaxationUsesTwoHalfSteps) {
+  ThermalMode rhs{-1.};
+  std::vector<double> y{1.01};
+  auto result = adaptive_step(y, 1.e8, rhs);
+  ASSERT_TRUE(result.converged());
+  EXPECT_EQ(result.accepted_dt, 1.e8);
+  const double expected = 1. + .01 / std::pow(1. + .5 * result.accepted_dt, 2);
+  EXPECT_DOUBLE_EQ(y[0], expected);
+  EXPECT_LT(std::fabs(y[0] - 1.), 1.e-12);
+}
+
+TEST(AdaptiveBackwardEuler, ResolvesHotAndColdTransientsThenRelaxes) {
+  for (double initial : {0.7, 1.3}) {
+    ThermalMode rhs{-1.};
+    std::vector<double> y{initial};
+    double elapsed = 0.;
+    int substeps = 0;
+    while (elapsed < 1.e5 && substeps < 200) {
+      const double old = y[0];
+      auto result = adaptive_step(y, 1.e5 - elapsed, rhs);
+      ASSERT_TRUE(result.converged()) << "initial energy = " << initial;
+      ASSERT_GT(result.accepted_dt, 0.);
+      EXPECT_LE(std::fabs(y[0] - old), .1 * old * (1. + 1.e-12));
+      EXPECT_LE(result.error_norm, 1.);
+      elapsed += result.accepted_dt;
+      ++substeps;
+    }
+    EXPECT_LT(substeps, 200);
+    EXPECT_DOUBLE_EQ(elapsed, 1.e5);
+    EXPECT_NEAR(y[0], 1., 1.e-8);
+  }
+}
+
+TEST(AdaptiveBackwardEuler, UnstableModeGrowsInsteadOfRelaxingToWrongRoot) {
+  ThermalMode rhs{1.};
+  for (double initial : {.7, 1.3}) {
+    std::vector<double> y{initial};
+    auto result = adaptive_step(y, 1.e5, rhs);
+    ASSERT_TRUE(result.converged());
+    EXPECT_LE(result.accepted_dt, .1);
+    EXPECT_GT(std::fabs(y[0] - 1.), std::fabs(initial - 1.));
+    const double exact = 1. + (initial - 1.) * std::exp(result.accepted_dt);
+    EXPECT_NEAR(y[0], exact, 1.e-3 * initial);
+  }
+}
+
+TEST(AdaptiveBackwardEuler, ChecksStabilityAtCandidateNotOnlyAtStart) {
+  // The thermal derivative starts negative and becomes positive as y passes
+  // one. A large BE step can end on that unstable side despite its stable
+  // initial derivative. Loose accuracy bounds isolate the stability guard.
+  auto rhs = [](const double* y, double* f, GRIMPL_NS::View<double**> jac) {
+    f[0] = (y[0] - 1.) * (y[0] - 1.) + .01;
+    jac(0, 0) = 2. * (y[0] - 1.);
+  };
+  std::vector<double> y{.8};
+  auto result = adaptive_step(y, 16., rhs, 0, 1., 1.);
+  ASSERT_TRUE(result.converged());
+  EXPECT_LT(result.accepted_dt, 16.);
+  EXPECT_GT(y[0], .8);
+  const double final_j = 2. * (y[0] - 1.);
+  if (final_j > 0.) { EXPECT_LE(result.accepted_dt * final_j, .1); }
+}
+
+TEST(AdaptiveBackwardEuler, PreservesReactionInvariantAndAbsentSpecies) {
+  auto rhs = [](const double* y, double* f, GRIMPL_NS::View<double**> jac) {
+    f[0] = 1000. * (y[1] - y[0]);
+    f[1] = -f[0];
+    f[2] = 0.;
+    for (int i = 0; i < 3; ++i) {
+      for (int j = 0; j < 3; ++j) { jac(i, j) = 0.; }
+    }
+    jac(0, 0) = jac(1, 1) = -1000.;
+    jac(0, 1) = jac(1, 0) = 1000.;
+  };
+  std::vector<double> y{.499, .501, 0.};
+  auto result = adaptive_step(y, 10., rhs, -1);
+  ASSERT_TRUE(result.converged());
+  EXPECT_EQ(result.accepted_dt, 10.);
+  EXPECT_NEAR(y[0] + y[1], 1., 1.e-11);
+  EXPECT_NEAR(y[0], .5, 1.e-10);
+  EXPECT_EQ(y[2], 0.);
+}
+
+TEST(AdaptiveBackwardEuler, ZeroSpeciesCanBeProducedWithAbsoluteTolerance) {
+  auto rhs = [](const double*, double* f, GRIMPL_NS::View<double**> jac) {
+    f[0] = 1.;
+    jac(0, 0) = 0.;
+  };
+  std::vector<double> y{0.};
+  auto result = adaptive_step(y, 1., rhs, -1);
+  ASSERT_TRUE(result.converged());
+  EXPECT_GT(y[0], 0.);
+  EXPECT_NEAR(y[0], result.accepted_dt, 1.e-25);
+}
+
+TEST(AdaptiveBackwardEuler, RetriesAreBoundedAndFailureRollsBack) {
+  int calls = 0;
+  auto rhs = [&calls](const double* y, double* f,
+                      GRIMPL_NS::View<double**> jac) {
+    ++calls;
+    // Deliberately reject every attempted update to model an RHS domain
+    // failure. The initial evaluation is valid, so retries really execute.
+    f[0] = (y[0] > 1.) ? std::numeric_limits<double>::quiet_NaN() : 1.;
+    jac(0, 0) = 0.;
+  };
+  std::vector<double> y{1.};
+  auto result = adaptive_step(y, 1., rhs, 0, 1.e-3, .1, 1.e-14, 3);
+  EXPECT_FALSE(result.converged());
+  EXPECT_EQ(result.retries, 3);
+  EXPECT_GT(calls, 1);
+  EXPECT_LE(calls, 12);
+  EXPECT_EQ(result.accepted_dt, 0.);
+  EXPECT_EQ(y[0], 1.);
+}
+
+TEST(AdaptiveBackwardEuler, CannotAdvanceBelowCallerProgressFloor) {
+  ThermalMode rhs{1.};
+  std::vector<double> y{1.3};
+  auto result = adaptive_step(y, 1., rhs, 0, 1.e-3, .1, .2);
+  EXPECT_FALSE(result.converged());
+  EXPECT_EQ(result.accepted_dt, 0.);
+  EXPECT_EQ(y[0], 1.3);
+}
+
+TEST(IntegrateFiniteChecks, RejectsNaNAndInfiniteRightHandSide) {
+  for (double invalid : {std::numeric_limits<double>::quiet_NaN(),
+                         std::numeric_limits<double>::infinity()}) {
+    auto rhs = [invalid](const double*, double* f,
+                         GRIMPL_NS::View<double**> jac) {
+      f[0] = invalid;
+      jac(0, 0) = 0.;
+    };
+    std::vector<double> y{1.};
+    EXPECT_FALSE(integrate(y, 1., rhs).converged());
+    EXPECT_EQ(y[0], 1.);
+  }
 }

@@ -264,6 +264,10 @@ inline void configure_ContextPack(
   ContextPack* pack, const grackle_field_data* my_fields,
   int field_idx1d, gr_mask_type local_itmask_metal, int local_edot_handling
 ) {
+  // Rebind self-references as well: ContextPack can be returned by value.
+  pack->fields.grid_dimension = pack->grid_dimension;
+  pack->fields.grid_start = pack->grid_start;
+  pack->fields.grid_end = pack->grid_end;
   pack->local_itmask_metal = local_itmask_metal;
   pack->local_edot_handling = local_edot_handling;
   pack->fields.grid_dx = my_fields->grid_dx;
@@ -414,9 +418,8 @@ inline void scratchbufs_copy_from_pack(
 
 /// calculate the time derivatives
 ///
-/// @param[in] dt_FIXME Specifies the timestep passed to the
-///   lookup_cool_rates1d function. See the docstring for that function
-///   for more details (this needs to be revisited)
+/// @param[in] dt_FIXME Unused compatibility argument. Reaction and cooling
+///   rates in this implementation depend only on the supplied state.
 /// @param[in] rhosp Specifies the species mass densities to use for computing
 ///   the time derivatives. This always has enough space for each species (it
 ///   is indexed by SpLUT), even if some entries are not evolved.
@@ -581,16 +584,18 @@ inline void derivatives(
 
   // uses the temperature to look up the chemical rates (they are interpolated
   // with respect to log temperature from input tables)
-  GRIMPL_NS::lookup_cool_rates1d(
-    pack.idx_range_1_element,
-    pack.other_scratch_buf.tgas, pack.other_scratch_buf.mmw,
-    pack.fwd_args.dom, pack.fwd_args.dx_cgs, pack.fwd_args.c_ljeans,
-    pack.other_scratch_buf.itmask, &pack.local_itmask_metal,
-    my_chemistry, my_rates, &pack.fields, sp_densities, my_uvb_rates, internalu,
-    pack.main_scratch_buf.logTlininterp_buf,
-    pack.main_scratch_buf.rxn_rate_buf,
-    pack.main_scratch_buf.chemheatrates_buf
-  );
+  if (my_chemistry->primordial_chemistry > 0) {
+    GRIMPL_NS::lookup_cool_rates1d(
+      pack.idx_range_1_element,
+      pack.other_scratch_buf.tgas, pack.other_scratch_buf.mmw,
+      pack.fwd_args.dom, pack.fwd_args.dx_cgs, pack.fwd_args.c_ljeans,
+      pack.other_scratch_buf.itmask, &pack.local_itmask_metal,
+      my_chemistry, my_rates, &pack.fields, sp_densities, my_uvb_rates, internalu,
+      pack.main_scratch_buf.logTlininterp_buf,
+      pack.main_scratch_buf.rxn_rate_buf,
+      pack.main_scratch_buf.chemheatrates_buf
+    );
+  }
 
 
   // The following function nominally computes dedot and HIdot (the time
@@ -598,7 +603,8 @@ inline void derivatives(
   // -> we don't care about these quantities (we recompute them later)
   // -> I'm pretty sure we care about how the following function also modifies
   //    edot
-  if (pack.local_edot_handling == 1)  {
+  if ((pack.local_edot_handling == 1) &&
+      (my_chemistry->primordial_chemistry > 0)) {
 
     grackle::impl::rate_timestep_g(
       pack.other_scratch_buf.dedot, pack.other_scratch_buf.HIdot,
@@ -618,13 +624,16 @@ inline void derivatives(
   );
 
 
-  View<gr_float**> rhosp_dot_view(rhosp_dot.data[0],
+  View<double**> rhosp_dot_view(rhosp_dot.data[0],
                                   MAX_EVOLVED_SPECIES_FIELDS, 1);
 
   // Initialize entries of the derivatives buffer to 0
   for (int sp_idx = 0; sp_idx < MAX_EVOLVED_SPECIES_FIELDS; sp_idx++) {
     rhosp_dot_view(sp_idx,0) = 0.0;
   }
+
+  // A tabulated (primordial_chemistry == 0) problem evolves only energy.
+  if (my_chemistry->primordial_chemistry == 0) return;
 
   gr_chem::species_density_derivatives_0d(
     rhosp_dot_view, pack.fwd_args.anydust, pack.other_scratch_buf.rhoH,
