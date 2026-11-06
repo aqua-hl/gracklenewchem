@@ -625,6 +625,8 @@ For all on/off integer flags, 0 is off and 1 is on.
      for stiff thermal relaxation or repeated heating/cooling sign changes.
      Selection is made separately for
      each cell and subcycle; it does not use density/temperature thresholds.
+     Once a cell has used Newton-Raphson, it stays on Newton-Raphson for the
+     rest of the :c:func:`solve_chemistry` call.
    * 2: use Gauss-Seidel only.
    * 3: use adaptive Newton-Raphson only.
 

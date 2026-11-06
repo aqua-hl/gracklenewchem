@@ -133,12 +133,18 @@ static void enforce_max_heatcool_subcycle_dt_(
 /// a secant across subcycles mixes chemistry changes into the thermal slope.
 /// Repeated heating/cooling sign changes also promote cells to NR. Positive
 /// thermal slopes are accuracy-limited in both schemes.
+///
+/// A cell that has used NR stays on NR for the rest of the call (`used_nr`).
+/// The stiffness test scales with the remaining time, so near the end of a
+/// call it always fails; without this a cell whose chemistry is still evolving
+/// finishes with one large explicit GS step (≈10% temperature error for a
+/// shock-heated cell; NR-only and this rule agree to 0.1%).
 static void setup_chem_scheme_masks_(
   IndexRange idx_range, const gr_mask_type* itmask,
   gr_mask_type* itmask_gs, gr_mask_type* itmask_nr, int* imp_eng,
   const double* thermal_slope, const int* sign_flips,
   const double* ttot, double dt,
-  const chemistry_data* chemistry
+  const chemistry_data* chemistry, unsigned char* used_nr
 ) {
   for (int i = idx_range.i_start; i < idx_range.i_stop; ++i) {
     const bool active = itmask[i] != MASK_FALSE;
@@ -148,7 +154,9 @@ static void setup_chem_scheme_masks_(
     const bool has_equations = chemistry->primordial_chemistry > 0 ||
         chemistry->with_radiative_cooling == 1;
     const bool use_nr = active && has_equations && chemistry->solver_method != 2 &&
-        (chemistry->solver_method == 3 || stiff_thermal || sign_flips[i] >= 2);
+        (chemistry->solver_method == 3 || stiff_thermal || sign_flips[i] >= 2 ||
+         used_nr[i] != 0);
+    if (use_nr) { used_nr[i] = 1; }
     itmask_nr[i] = use_nr ? MASK_TRUE : MASK_FALSE;
     itmask_gs[i] = active && !use_nr ? MASK_TRUE : MASK_FALSE;
     imp_eng[i] = use_nr && chemistry->with_radiative_cooling == 1 ? 1 : 0;
@@ -749,6 +757,7 @@ int solve_rate_cool(
     std::vector<double> next_nr_dt(my_fields->grid_dimension[0]);
     std::vector<double> minimum_dt(my_fields->grid_dimension[0]);
     std::vector<int> sign_flips(my_fields->grid_dimension[0]);
+    std::vector<unsigned char> used_nr(my_fields->grid_dimension[0]);
     // Allocate this relatively large scratch workspace only for calculations
     // that evolve energy, and reuse it throughout the worker's rows.
     std::unique_ptr<ThermalSlopeProbe> thermal_probe;
@@ -820,6 +829,7 @@ int solve_rate_cool(
         // rows and are not initialized, so start each row with no history.
         spsolvbuf.dedot_prev[i] = huge8;
         spsolvbuf.HIdot_prev[i] = huge8;
+        used_nr[i] = 0;
       }
 
       // A useful slice variable since we do this a lot
@@ -956,7 +966,7 @@ int solve_rate_cool(
         setup_chem_scheme_masks_(idx_range, itmask.data(), spsolvbuf.itmask_gs,
           spsolvbuf.itmask_nr, spsolvbuf.imp_eng, thermal_slope.data(),
           sign_flips.data(), ttot.data(), dt,
-          my_chemistry);
+          my_chemistry, used_nr.data());
 
         if (my_chemistry->primordial_chemistry > 0) {
           // Set the max timestep for the current subcycle based on our scheme
