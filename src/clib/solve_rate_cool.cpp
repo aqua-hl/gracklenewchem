@@ -753,6 +753,11 @@ int solve_rate_cool(
     std::vector<double> nelec_times_mH(my_fields->grid_dimension[0]);
     std::vector<double> edot(my_fields->grid_dimension[0]);
     std::vector<double> thermal_slope(my_fields->grid_dimension[0]);
+    // state at each cell's last thermal probe, and the cells to re-probe
+    std::vector<double> probe_T(my_fields->grid_dimension[0]);
+    std::vector<double> probe_de(my_fields->grid_dimension[0]);
+    std::vector<gr_mask_type> probe_mask(my_fields->grid_dimension[0]);
+    std::vector<double> probe_base(my_fields->grid_dimension[0]);
     std::vector<double> previous_edot(my_fields->grid_dimension[0]);
     std::vector<double> next_nr_dt(my_fields->grid_dimension[0]);
     std::vector<double> minimum_dt(my_fields->grid_dimension[0]);
@@ -823,6 +828,7 @@ int solve_rate_cool(
         next_nr_dt[i] = std::numeric_limits<double>::infinity();
         previous_edot[i] = 0.;
         thermal_slope[i] = 0.;
+        probe_T[i] = -1.;  // no probe yet: probe on the first subcycle
         sign_flips[i] = 0;
         // The GS rate limiter (iter > 50) compares against the change seen in
         // this cell's previous GS subcycle. These buffers are reused across
@@ -953,8 +959,45 @@ int solve_rate_cool(
           minimum_dt[i] = std::nextafter(ttot[i],
               std::numeric_limits<double>::infinity()) - ttot[i];
         }
-        const bool probe_ok = !thermal_probe || thermal_probe->evaluate(
-            my_fields, idx_range, itmask.data(), thermal_slope.data());
+        // The fixed-composition thermal slope changes only with T and
+        // composition, so re-probe a cell only once its temperature or
+        // electron density has moved by more than these fractions since its
+        // last probe. Probing every subcycle doubled the cost of GS cells.
+        constexpr double probe_tol_T = 0.02, probe_tol_de = 0.1;
+        bool any_probe = false;
+        for (int i = idx_range.i_start; i < idx_range.i_stop; ++i) {
+          bool need = itmask[i] != MASK_FALSE;
+          const long long idx = i + (long long)my_fields->grid_dimension[0] *
+              (j + (long long)my_fields->grid_dimension[1] * k);
+          const double de_now = my_chemistry->primordial_chemistry > 0 ?
+              my_fields->e_density[idx] : 1.;
+          if (need && probe_T[i] > 0.) {
+            need = std::fabs(std::log(tgas[i] / probe_T[i])) > probe_tol_T ||
+                   std::fabs(std::log(de_now / probe_de[i])) > probe_tol_de;
+          }
+          probe_mask[i] = need ? MASK_TRUE : MASK_FALSE;
+          if (need) {
+            probe_T[i] = tgas[i];
+            probe_de[i] = de_now;
+          }
+          any_probe = any_probe || need;
+        }
+        bool probe_ok = true;
+        if (thermal_probe && any_probe) {
+          if (iter == 1) {
+            // On the first subcycle edot above was evaluated at the current
+            // state without temperature damping, so a one-sided difference
+            // needs only one extra RHS evaluation.
+            for (int i = idx_range.i_start; i < idx_range.i_stop; ++i) {
+              probe_base[i] = edot[i] / d(i,j,k);
+            }
+            probe_ok = thermal_probe->evaluate_one_sided(my_fields, idx_range,
+                probe_mask.data(), probe_base.data(), thermal_slope.data());
+          } else {
+            probe_ok = thermal_probe->evaluate(my_fields, idx_range,
+                probe_mask.data(), thermal_slope.data());
+          }
+        }
         if (!probe_ok) {
           OMP_PRAGMA_CRITICAL
           {

@@ -116,10 +116,10 @@ public:
     drop_FullRxnRateBuffer(&rates_);
   }
 
-  bool evaluate(const grackle_field_data* fields, IndexRange row,
-                const gr_mask_type* active, double* slopes) {
-    if (fields->grid_dimension[0] != row_size_ || row.i_start < 0 ||
-        row.i_stop > row_size_) return false;
+private:
+  /// Point the private row view at row (j, k) of `fields`; returns the 1D
+  /// offset of that row and rewrites `row` to index the private view.
+  int bind_row_(const grackle_field_data* fields, IndexRange& row) {
     const int offset = layoutleft_3D_index_to_1D_(
       fields->grid_dimension, 0, row.j, row.k);
     copy_offset_fieldmember_ptrs_(&fields_, fields, offset);
@@ -128,7 +128,51 @@ public:
     ends_[0] = row.i_end;
     row.j = row.k = 0;
     row.jp1 = row.kp1 = 1;
-    const double epsilon = (sizeof(gr_float) == sizeof(float)) ? 1.e-2 : 1.e-4;
+    return offset;
+  }
+
+  static constexpr double epsilon_ =
+    (sizeof(gr_float) == sizeof(float)) ? 1.e-2 : 1.e-4;
+
+public:
+  /// One-sided slope from a caller-supplied f(e) = edot/rho evaluated at the
+  /// current state without temperature damping: one RHS evaluation per row
+  /// instead of two.
+  bool evaluate_one_sided(const grackle_field_data* fields, IndexRange row,
+                          const gr_mask_type* active, const double* base_rhs,
+                          double* slopes) {
+    if (fields->grid_dimension[0] != row_size_ || row.i_start < 0 ||
+        row.i_stop > row_size_) return false;
+    const int offset = bind_row_(fields, row);
+    bool any_active = false;
+    for (int i = row.i_start; i < row.i_stop; ++i) {
+      if (active[i] == MASK_FALSE) continue;
+      any_active = true;
+      const double energy = fields->internal_energy[offset + i];
+      const double density = fields->density[offset + i];
+      energy_hi_[i] = static_cast<gr_float>(energy * (1. + epsilon_));
+      if (!(std::isfinite(energy) && energy > 0. && std::isfinite(density) &&
+            density > 0. && std::isfinite(energy_hi_[i]) &&
+            energy_hi_[i] > energy && std::isfinite(base_rhs[i]))) return false;
+    }
+    if (!any_active) return true;
+    evaluate_rhs_(row, active, energy_hi_.data());
+    for (int i = row.i_start; i < row.i_stop; ++i) {
+      if (active[i] == MASK_FALSE) continue;
+      const double high_rhs = edot_[i] / fields_.density[i];
+      slopes[i] = (high_rhs - base_rhs[i]) /
+        (double(energy_hi_[i]) - double(fields->internal_energy[offset + i]));
+      if (!(std::isfinite(high_rhs) && std::isfinite(slopes[i]))) return false;
+    }
+    return true;
+  }
+
+  bool evaluate(const grackle_field_data* fields, IndexRange row,
+                const gr_mask_type* active, double* slopes) {
+    if (fields->grid_dimension[0] != row_size_ || row.i_start < 0 ||
+        row.i_stop > row_size_) return false;
+    const int offset = bind_row_(fields, row);
+    const double epsilon = epsilon_;
     bool any_active = false;
     for (int i = row.i_start; i < row.i_stop; ++i) {
       if (active[i] == MASK_FALSE) continue;
