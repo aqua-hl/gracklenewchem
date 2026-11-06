@@ -15,7 +15,10 @@
 #ifndef MATH_INTEGRATE_HPP
 #define MATH_INTEGRATE_HPP
 
+#include <algorithm>
 #include <cmath>
+#include <initializer_list>
+#include <limits>
 
 #include "../grackle_macros.h"
 #include "gaussj.hpp"
@@ -63,18 +66,31 @@ class StiffNewtonRaphson {
   /// maximum number of iterations
   int maxiter_;
 
+  // Precision of the inputs seen by the RHS (zero disables the rounding
+  // fallback). Newton itself always uses double precision.
+  double rhs_relative_roundoff_;
+  double rhs_absolute_roundoff_;
+
 public:  // public API
   StiffNewtonRaphson() = delete;
 
   /// @brief primary constructor
-  StiffNewtonRaphson(int max_evolved_variables, double max_rtol, int maxiter)
+  /// rhs_relative_roundoff/rhs_absolute_roundoff describe the precision of
+  /// inputs rounded inside the RHS (typically epsilon and denorm_min of the
+  /// field type). Zero disables the local rounding-neighborhood check used
+  /// by step_modified; the legacy step method does not use that check.
+  StiffNewtonRaphson(int max_evolved_variables, double max_rtol, int maxiter,
+                     double rhs_relative_roundoff = 0.,
+                     double rhs_absolute_roundoff = 0.)
       : max_evolved_variables_{max_evolved_variables},
         max_rtol_{max_rtol},
-        maxiter_{maxiter} {}
+        maxiter_{maxiter},
+        rhs_relative_roundoff_{rhs_relative_roundoff},
+        rhs_absolute_roundoff_{rhs_absolute_roundoff} {}
 
   // upper bound on the scratch space needed in step
   int num_scratch_buf_elements() const noexcept {
-    int n_vectors = 4;   // f, vec, ycur_minus_ystart and (modified) scale
+    int n_vectors = 9;   // five iteration vectors and four rounding-probe vectors
     int n_matrices = 2;  // jacobian_f and mtrx
     int entries_per_matrix = max_evolved_variables_ * max_evolved_variables_;
     return n_vectors * max_evolved_variables_ + n_matrices * entries_per_matrix;
@@ -329,25 +345,48 @@ public:  // public API
   /// `shared_jacobian` (may be null) is reused for every iteration, so an
   /// iteration costs one evaluation of `calc_f` instead of n + 1. When the
   /// correction shrinks by less than half per iteration the Jacobian is
-  /// rebuilt at the current iterate (at most 3 times). `f_at_start` (may be
-  /// null) is f(y) at entry. Components and equations are scaled as in
+  /// rebuilt at the current iterate. `f_at_start` (may be null) is f(y) at
+  /// entry; `jacobian_at_start` says whether `shared_jacobian` was evaluated
+  /// at the entry state. Components and equations are scaled as in
   /// @ref step; `absolute_tolerance` is required. Iterates must stay
   /// non-negative and finite. A Jacobian whose columns conserve the RHS's
   /// linear invariants keeps those invariants for every iterate.
+  ///
+  /// A small correction or apparent contraction only requests validation.
+  /// Acceptance requires a finite RHS and a small backward-Euler residual
+  /// evaluated AFTER applying the correction. Even a fresh Jacobian can give
+  /// a misleadingly small correction when it crosses a sharp rate transition.
+  /// When RHS input precision is supplied, a roundoff-limited solve may also
+  /// pass if both the fresh Newton correction and a coupled secant root of
+  /// sampled residuals fit inside a few input ULPs, below nonlinear tolerance.
+  ///
+  /// If `jacobian_out` is given and the solve converges, a Jacobian evaluated
+  /// at the returned state is copied there and `*jacobian_exported` is set.
   template <typename FnF, typename FnFJ>
   IntegrateResult step_modified(double* y, double h, const FnF& calc_f,
                                 const FnFJ& calc_f_and_jacobian, int n,
                                 double* scratch_ptr,
                                 const double* absolute_tolerance,
                                 const View<double**>* shared_jacobian,
-                                const double* f_at_start) const {
+                                const double* f_at_start,
+                                bool jacobian_at_start,
+                                View<double**>* jacobian_out = nullptr,
+                                bool* jacobian_exported = nullptr) const {
+    if (jacobian_exported != nullptr) { *jacobian_exported = false; }
     double* ycur_minus_ystart = scratch_ptr;
     double* vec = ycur_minus_ystart + n;
     double* f = vec + n;
     double* s = f + n;
-    View<double**> jac_local(s + n, n, n);
-    View<double**> mtrx(s + n + n * n, n, n);
+    double* y_start = s + n;
+    double* probe = y_start + n;
+    double* f_probe = probe + n;
+    double* lower_delta = f_probe + n;
+    double* residual_offset = lower_delta + n;
+    View<double**> jac_local(residual_offset + n, n, n);
+    View<double**> mtrx(jac_local.data() + n * n, n, n);
     const View<double**>* J = shared_jacobian;
+    // true while J was evaluated at the iterate the next correction starts from
+    bool jacobian_current = jacobian_at_start;
     bool f_ready = false;
     if (f_at_start != nullptr) {
       for (int i = 0; i < n; i++) { f[i] = f_at_start[i]; }
@@ -356,11 +395,15 @@ public:  // public API
     if (J == nullptr) {
       calc_f_and_jacobian(y, f, jac_local);
       J = &jac_local;
+      jacobian_current = true;
       f_ready = true;
     }
-    for (int i = 0; i < n; i++) { ycur_minus_ystart[i] = 0.0; }
+    for (int i = 0; i < n; i++) {
+      y_start[i] = y[i];
+      ycur_minus_ystart[i] = 0.0;
+    }
+    // size of the previous correction made with the same Jacobian (or -1)
     double previous = -1.0;
-    int refreshes = 0;
     for (int k = 0; k < maxiter_; k++) {
       if (!f_ready) { calc_f(y, f); }
       f_ready = false;
@@ -409,17 +452,159 @@ public:  // public API
                                         : (vec[i] == 0. ? 0. : HUGE_VAL);
         max_rel = std::fmax(max_rel, err);
       }
-      if (max_rel <= max_rtol_) {
-        return IntegrateResult{TerminateFlag::CONVERGED, k + 1};
+      bool looks_converged = max_rel <= max_rtol_;
+      if (!looks_converged && !jacobian_current && previous > 0.) {
+        const double theta = max_rel / previous;
+        looks_converged =
+          theta < 1. && max_rel * theta / (1. - theta) <= max_rtol_;
       }
-      if (previous > 0. && max_rel > 0.5 * previous && refreshes < 3) {
-        calc_f_and_jacobian(y, f, jac_local);
+      const bool slow = previous > 0. && max_rel > 0.5 * previous;
+      if (looks_converged || slow) {
+        // This evaluates the actual candidate, not the state before the last
+        // correction. The exported Jacobian and RHS therefore refer to the
+        // same state that the caller receives.
+        // A converged full step needs only its residual. Rebuild the full
+        // Jacobian if iteration must continue or the caller needs to reuse it.
+        calc_f(y, f);
+        bool residual_small = true;
+        for (int i = 0; i < n; ++i) {
+          const double hf = h * f[i];
+          const double residual = hf - (y[i] - y_start[i]);
+          if (!std::isfinite(f[i]) || !std::isfinite(residual)) {
+            return IntegrateResult{TerminateFlag::OTHER_ERR, k + 1};
+          }
+          constexpr double eps = 32. * std::numeric_limits<double>::epsilon();
+          const double roundoff = eps * std::fabs(y_start[i])
+            + eps * std::fabs(y[i]) + eps * std::fabs(hf);
+          const double tolerance = absolute_tolerance[i] + max_rtol_ *
+            std::max(std::fabs(y_start[i]), std::fabs(y[i])) + roundoff;
+          if (!std::isfinite(tolerance)) {
+            return IntegrateResult{TerminateFlag::OTHER_ERR, k + 1};
+          }
+          residual_small = residual_small && std::fabs(residual) <= tolerance;
+        }
+        if (!looks_converged || !residual_small || jacobian_out != nullptr) {
+          calc_f_and_jacobian(y, f, jac_local);
+          for (int i = 0; i < n; ++i) {
+            if (!std::isfinite(f[i])) {
+              return IntegrateResult{TerminateFlag::OTHER_ERR, k + 1};
+            }
+            for (int j = 0; j < n; ++j) {
+              if (!std::isfinite(jac_local(i, j))) {
+                return IntegrateResult{TerminateFlag::OTHER_ERR, k + 1};
+              }
+            }
+          }
+        }
+        if (looks_converged && !residual_small &&
+            rhs_relative_roundoff_ > 0.) {
+          // A rounded RHS may have no exact BE root: adjacent field values
+          // can straddle equilibrium. Permit only state uncertainty of a few
+          // field ULPs, verified with actual signed residual changes. An
+          // allowance proportional to |h*J| would also hide a large residual
+          // on the flat side of a sharp transition, where no nearby root exists.
+          bool rounding_limited = true;
+          for (int i = 0; i < n; ++i) {
+            s[i] = std::max(std::fabs(y[i]),
+                           absolute_tolerance[i] / max_rtol_);
+            if (s[i] == 0.) { s[i] = 1.; }
+            vec[i] = (h * f[i] - (y[i] - y_start[i])) / s[i];
+            probe[i] = y[i];
+            for (int j = 0; j < n; ++j) {
+              mtrx(i, j) = (((i == j) ? 1. : 0.) - h * jac_local(i, j));
+            }
+          }
+          for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+              mtrx(i, j) *= s[j] / s[i];
+              rounding_limited = rounding_limited &&
+                std::isfinite(mtrx(i, j));
+            }
+          }
+          if (rounding_limited && gaussj(n, mtrx.data(), vec) != 1) {
+            for (int i = 0; i < n; ++i) {
+              const double radius = 4. * (rhs_relative_roundoff_ *
+                std::fabs(y[i]) + rhs_absolute_roundoff_);
+              const double tolerance = absolute_tolerance[i] +
+                max_rtol_ * std::fabs(y[i]);
+              const double correction = vec[i] * s[i];
+              rounding_limited = rounding_limited && std::isfinite(radius) &&
+                radius <= tolerance && std::isfinite(correction) &&
+                std::fabs(correction) <= radius;
+            }
+          } else {
+            rounding_limited = false;
+          }
+          for (int i = 0; i < n; ++i) {
+            residual_offset[i] = h * f[i] - (y[i] - y_start[i]);
+          }
+          for (int j = 0; j < n && rounding_limited; ++j) {
+            const double radius = 4. * (rhs_relative_roundoff_ *
+              std::fabs(y[j]) + rhs_absolute_roundoff_);
+            const double lower = std::max(0., y[j] - radius) - y[j];
+            const double upper = (y[j] + radius) - y[j];
+            const double width = upper - lower;
+            if (!std::isfinite(width) || width <= 0.) {
+              rounding_limited = false;
+              break;
+            }
+            // Interpolate the actual signed residuals across each coordinate's
+            // rounding interval. Solve the resulting coupled system: separate
+            // per-equation sign brackets could describe incompatible states.
+            for (int sign : {-1, 1}) {
+              probe[j] = y[j] + ((sign < 0) ? lower : upper);
+              calc_f(probe, f_probe);
+              for (int i = 0; i < n; ++i) {
+                const double delta = h * (f_probe[i] - f[i])
+                  - ((i == j) ? probe[j] - y[j] : 0.);
+                if (!std::isfinite(delta)) { rounding_limited = false; break; }
+                if (sign < 0) {
+                  lower_delta[i] = delta;
+                } else {
+                  const double slope = (delta - lower_delta[i]) / width;
+                  residual_offset[i] += lower_delta[i] - slope * lower;
+                  mtrx(i, j) = slope * s[j] / s[i];
+                  rounding_limited = rounding_limited &&
+                    std::isfinite(residual_offset[i]) &&
+                    std::isfinite(mtrx(i, j));
+                }
+              }
+              if (!rounding_limited) { break; }
+            }
+            probe[j] = y[j];
+          }
+          if (rounding_limited) {
+            for (int i = 0; i < n; ++i) { vec[i] = -residual_offset[i] / s[i]; }
+            rounding_limited = gaussj(n, mtrx.data(), vec) != 1;
+          }
+          for (int i = 0; i < n && rounding_limited; ++i) {
+            const double radius = 4. * (rhs_relative_roundoff_ *
+              std::fabs(y[i]) + rhs_absolute_roundoff_);
+            const double correction = vec[i] * s[i];
+            rounding_limited = std::isfinite(correction) &&
+              correction >= std::max(0., y[i] - radius) - y[i] &&
+              correction <= (y[i] + radius) - y[i];
+          }
+          residual_small = rounding_limited;
+        }
+        if (looks_converged && residual_small) {
+          if (jacobian_out != nullptr) {
+            for (int i = 0; i < n; ++i) {
+              for (int j = 0; j < n; ++j) {
+                (*jacobian_out)(i, j) = jac_local(i, j);
+              }
+            }
+            if (jacobian_exported != nullptr) { *jacobian_exported = true; }
+          }
+          return IntegrateResult{TerminateFlag::CONVERGED, k + 1};
+        }
         J = &jac_local;
+        jacobian_current = true;
         f_ready = true;
-        ++refreshes;
         previous = -1.0;
         continue;
       }
+      jacobian_current = false;  // the iterate has moved
       previous = max_rel;
     }
     return IntegrateResult{TerminateFlag::CONVERGE_ERR, maxiter_ + 1};

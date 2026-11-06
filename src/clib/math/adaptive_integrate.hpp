@@ -42,10 +42,12 @@ struct AdaptiveIntegrateResult {
 /// large backward-Euler steps from spuriously damping that growing mode.
 /// It does not assert stability of every eigenmode of a coupled network.
 ///
-/// Cost: the Jacobian at the start of a substep is computed once and reused
-/// by all three backward-Euler solves (modified Newton, rebuilt only when the
-/// iteration contracts slowly). The guard needs only J_ee, so it costs two
-/// RHS evaluations per candidate state instead of a full Jacobian.
+/// Cost: the Jacobian at the start of a substep is reused by the backward-Euler
+/// solves (modified Newton). It is rebuilt when the iteration contracts slowly
+/// or endpoint residual validation fails. Before convergence is accepted,
+/// the RHS is always checked at the returned state. The first half step's
+/// actual endpoint Jacobian starts the second half. At the final endpoint only
+/// the thermal diagonal is needed, so the guard evaluates it directly.
 class AdaptiveBackwardEuler {
   int max_variables_;
   double relative_tolerance_;
@@ -80,17 +82,20 @@ public:
                                  double max_fractional_change = 0.1,
                                  int max_retries = 40,
                                  double nonlinear_tolerance = 1.e-8,
-                                 double jacobian_step = 1.e-4)
+                                 double jacobian_step = 1.e-4,
+                                 double rhs_relative_roundoff = 0.,
+                                 double rhs_absolute_roundoff = 0.)
       : max_variables_(max_variables),
         relative_tolerance_(relative_tolerance),
         max_fractional_change_(max_fractional_change),
         max_retries_(max_retries),
         jacobian_step_(jacobian_step),
-        newton_(max_variables, nonlinear_tolerance, 20) {}
+        newton_(max_variables, nonlinear_tolerance, 20,
+                rhs_relative_roundoff, rhs_absolute_roundoff) {}
 
   int num_scratch_buf_elements() const noexcept {
-    // Nine vectors and one matrix, plus the Newton solver's scratch space.
-    return 9 * max_variables_ + max_variables_ * max_variables_
+    // Nine vectors and two matrices, plus the Newton solver's scratch space.
+    return 9 * max_variables_ + 2 * max_variables_ * max_variables_
       + newton_.num_scratch_buf_elements();
   }
 
@@ -145,7 +150,9 @@ public:
     double* probe = f_initial + n;
     double* f_probe = probe + n;
     View<double**> jac(f_probe + n, n, n);
-    double* newton_scratch = jac.data() + n * n;
+    // Jacobian validated at the actual end of the first half step
+    View<double**> jac_mid(jac.data() + n * n, n, n);
+    double* newton_scratch = jac_mid.data() + n * n;
 
     for (int i = 0; i < n; ++i) {
       if (!std::isfinite(absolute_tolerance[i]) || absolute_tolerance[i] < 0.) {
@@ -194,32 +201,54 @@ public:
 
       std::copy(initial, initial + n, full);
       std::copy(initial, initial + n, fine);
+      // The full step and the first half start at `initial`, where `jac` was
+      // evaluated. The second half starts at the midpoint with a Jacobian
+      // evaluated at the returned midpoint (after its final correction).
+      bool mid_ok = false;
       auto run_newton = [&](double* state, double step_dt,
-                            const double* f_start) {
+                            const View<double**>* jacobian,
+                            const double* f_start, bool jacobian_at_start,
+                            View<double**>* jacobian_out, bool* exported) {
         IntegrateResult nr = newton_.step_modified(
           state, step_dt, calc_f, calc_f_and_jacobian, n, newton_scratch,
-          newton_atol, &jac, f_start);
+          newton_atol, jacobian, f_start, jacobian_at_start, jacobian_out,
+          exported);
         result.newton_iterations += nr.iterations;
         return nr.converged() && valid_state_(state, n, energy_index);
       };
 
-      if (!run_newton(full, h, f_initial) ||
-          !run_newton(fine, 0.5 * h, f_initial)) {
+      if (!run_newton(full, h, &jac, f_initial, true, nullptr, nullptr) ||
+          !run_newton(fine, 0.5 * h, &jac, f_initial, true, &jac_mid,
+                      &mid_ok)) {
         h *= 0.5;
         continue;
       }
       std::copy(fine, fine + n, middle);
-      if (!run_newton(fine, 0.5 * h, nullptr)) {
+      // No subsequent solve reuses the final endpoint's full Jacobian.
+      // Evaluate its thermal diagonal explicitly below instead.
+      if (!run_newton(fine, 0.5 * h, mid_ok ? &jac_mid : &jac, nullptr,
+                      mid_ok, nullptr, nullptr)) {
         h *= 0.5;
         continue;
       }
 
       // Check the entire candidate path, not only the initial derivative.
-      // Only J_ee is needed: one perturbed RHS evaluation per candidate.
+      // Only J_ee is needed: exported matrices are evaluated at the returned
+      // states, and Newton has checked their RHS values for finiteness. If no
+      // matrix was exported, evaluate the candidate and probe its slope here.
       double max_positive_j = std::max(0., initial_thermal_j);
       bool finite_candidate = true;
       if (energy_index >= 0) {
-        for (const double* candidate : {middle, fine}) {
+        for (int c = 0; c < 2; ++c) {
+          const double* candidate = (c == 0) ? middle : fine;
+          if (c == 0 && mid_ok) {
+            const double jee = jac_mid(energy_index, energy_index);
+            finite_candidate = finite_candidate && std::isfinite(jee);
+            if (finite_candidate) {
+              max_positive_j = std::max(max_positive_j, jee);
+            }
+            continue;
+          }
           calc_f(candidate, f);
           std::copy(candidate, candidate + n, probe);
           const double de = jacobian_step_ *

@@ -13,6 +13,7 @@
 #include <cmath>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -504,5 +505,446 @@ TEST(IntegrateFiniteChecks, RejectsNaNAndInfiniteRightHandSide) {
     std::vector<double> y{1.};
     EXPECT_FALSE(integrate(y, 1., rhs).converged());
     EXPECT_EQ(y[0], 1.);
+  }
+}
+
+// Cooling that is steep at the start and nearly flat at the solution, as when
+// cooling onto a floor or past a table cutoff: y' = -x (1 + B x^4), x = y - 1.
+// A Jacobian reused from a steep point shrinks later corrections, so a small
+// correction alone does not show that the backward-Euler equation is solved.
+namespace {
+struct SteepThenFlat {
+  double B;
+  void operator()(const double* y, double* f,
+                  GRIMPL_NS::View<double**> jac) const {
+    const double x = y[0] - 1.;
+    f[0] = -x * (1. + B * x * x * x * x);
+    jac(0, 0) = -(1. + 5. * B * x * x * x * x);
+  }
+};
+
+// Root of y - y0 - h f(y) = 0, which is increasing in y; bisect on [1, y0].
+double steep_then_flat_be_root(double y0, double h, double B) {
+  double lo = 1., hi = y0;
+  for (int it = 0; it < 200; ++it) {
+    const double mid = 0.5 * (lo + hi), x = mid - 1.;
+    const double g = mid - y0 + h * x * (1. + B * x * x * x * x);
+    (g > 0. ? hi : lo) = mid;
+  }
+  return 0.5 * (lo + hi);
+}
+
+// One modified-Newton backward-Euler solve from y_start, reusing the Jacobian
+// evaluated at y_jacobian.
+GRIMPL_NS::integrate::IntegrateResult steep_then_flat_solve(
+    double B, double h, double y_start, double y_jacobian, double& y_out) {
+  SteepThenFlat rhs{B};
+  const auto calc_f = [&](const double* y, double* f) {
+    double unused[1];
+    rhs(y, f, GRIMPL_NS::View<double**>(unused, 1, 1));
+  };
+  double point[] = {y_jacobian}, f_unused[1], jac_buf[1];
+  GRIMPL_NS::View<double**> jac(jac_buf, 1, 1);
+  rhs(point, f_unused, jac);
+  GRIMPL_NS::integrate::StiffNewtonRaphson solver(1, 1.e-6, 20);
+  std::vector<double> scratch(solver.num_scratch_buf_elements());
+  double y[] = {y_start};
+  const double atol[] = {1.e-13};
+  const auto result = solver.step_modified(
+    y, h, calc_f, rhs, 1, scratch.data(), atol, &jac, nullptr,
+    y_jacobian == y_start);
+  y_out = y[0];
+  return result;
+}
+}  // namespace
+
+TEST(StiffNewtonRaphson, StaleJacobianFirstCorrectionIsNotConvergence) {
+  // The second half step starts at the midpoint but reuses the start-state
+  // Jacobian. Here it is ~1e6 times steeper than the local one: the first
+  // correction is ~1e-8 although the iterate is 5% from the root.
+  double y;
+  const auto result = steep_then_flat_solve(1.e6, 1.e3, 1.05, 2., y);
+  ASSERT_TRUE(result.converged());
+  EXPECT_GT(result.iterations, 1);
+  const double exact = steep_then_flat_be_root(1.05, 1.e3, 1.e6);
+  EXPECT_NEAR(y, exact, 1.e-5 * exact);
+}
+
+TEST(StiffNewtonRaphson, ReusedJacobianConvergesToTheRootOrFails) {
+  // Steep at the start, flat at the solution, over a range of stiffness.
+  // Failing to converge is safe (the caller shortens the step); reporting
+  // convergence on a wrong answer is not.
+  for (double B : {1.e2, 1.e4, 1.e6, 1.e9, 1.e12}) {
+    for (double h : {1.e-3, 1.e-1, 1.e1, 1.e3}) {
+      double y;
+      const auto result = steep_then_flat_solve(B, h, 2., 2., y);
+      const double exact = steep_then_flat_be_root(2., h, B);
+      if (result.converged()) {
+        EXPECT_NEAR(y, exact, 1.e-5 * exact) << "B=" << B << " h=" << h;
+      }
+    }
+  }
+}
+
+// A smooth switch from steep to flat cooling: y' = -x (1 + B s(x)), x = y - 1,
+// s a sigmoid at x = 0.5. The first full-Newton step from the steep side lands
+// in the flat region; the next correction, made with the steep Jacobian, is
+// ~1e7 times too small. That single sharp drop looks like fast contraction,
+// but the equation is unsolved: acceptance must be validated with a Jacobian
+// evaluated at the current iterate.
+namespace {
+struct SmoothSteepToFlat {
+  double B = 1.e6, x_c = 0.5, w = 0.01;
+  void operator()(const double* y, double* f,
+                  GRIMPL_NS::View<double**> jac) const {
+    const double x = y[0] - 1.;
+    const double s = 1. / (1. + std::exp(-(x - x_c) / w));
+    const double ds = s * (1. - s) / w;
+    f[0] = -x * (1. + B * s);
+    jac(0, 0) = -(1. + B * s) - x * B * ds;
+  }
+};
+}  // namespace
+
+TEST(StiffNewtonRaphson, SharpDropInCorrectionIsNotConvergence) {
+  SmoothSteepToFlat rhs;
+  const auto calc_f = [&](const double* y, double* f) {
+    double unused[1];
+    rhs(y, f, GRIMPL_NS::View<double**>(unused, 1, 1));
+  };
+  for (double h : {1., 10., 100.}) {
+    double y[] = {2.}, f0[1], jac_buf[1];
+    GRIMPL_NS::View<double**> jac(jac_buf, 1, 1);
+    rhs(y, f0, jac);
+    GRIMPL_NS::integrate::StiffNewtonRaphson solver(1, 1.e-6, 20);
+    std::vector<double> scratch(solver.num_scratch_buf_elements());
+    const double atol[] = {1.e-13};
+    const auto result = solver.step_modified(y, h, calc_f, rhs, 1, scratch.data(),
+                                             atol, &jac, f0, true);
+    // y - 2 - h f(y) is increasing in y: bisect for the backward-Euler root.
+    double lo = 1., hi = 2.;
+    for (int it = 0; it < 200; ++it) {
+      const double mid = 0.5 * (lo + hi), x = mid - 1.;
+      const double s = 1. / (1. + std::exp(-(x - rhs.x_c) / rhs.w));
+      ((mid - 2. + h * x * (1. + rhs.B * s)) > 0. ? hi : lo) = mid;
+    }
+    const double exact = 0.5 * (lo + hi);
+    // Failing to converge is safe (the caller shortens the step); reporting
+    // convergence on a wrong answer is not. For h >= 10 the root is on the
+    // flat side, the case a reused steep Jacobian used to accept falsely.
+    if (result.converged()) {
+      EXPECT_NEAR(y[0], exact, 1.e-5 * exact) << "h=" << h;
+    }
+    if (h >= 10.) { EXPECT_TRUE(result.converged()) << "h=" << h; }
+  }
+}
+
+namespace {
+// A steep cooling branch followed by constant cooling. The smooth version
+// replaces max(x, 0) by a softplus of width 1e-10, so this regression does not
+// rely on a discontinuity of the Jacobian.
+struct ConstantCoolingTail {
+  bool smooth;
+  static constexpr double rate = 1.e8;
+  void operator()(const double* y, double* f,
+                  GRIMPL_NS::View<double**> jac) const {
+    const double x = y[0] - 1.;
+    if (!smooth) {
+      f[0] = -1. - rate * std::max(x, 0.);
+      jac(0, 0) = x > 0. ? -rate : 0.;
+      return;
+    }
+    constexpr double width = 1.e-10;
+    const double z = x / width;
+    const double softplus = z > 30. ? z : std::log1p(std::exp(z));
+    const double logistic = z >= 0. ? 1. / (1. + std::exp(-z))
+                                     : std::exp(z) / (1. + std::exp(z));
+    f[0] = -1. - rate * width * softplus;
+    jac(0, 0) = -rate * logistic;
+  }
+};
+}  // namespace
+
+TEST(StiffNewtonRaphson, ReturnedStateSatisfiesEquationAfterSlopeTransition) {
+  // The second case is the midpoint from the formerly failing adaptive
+  // step: even a current Jacobian gives a sub-tolerance correction that
+  // crosses the transition. Check the equation at the returned state.
+  for (bool smooth : {false, true}) {
+    ConstantCoolingTail rhs{smooth};
+    const auto calc_f = [&](const double* y, double* f) {
+      double unused;
+      rhs(y, f, GRIMPL_NS::View<double**>(&unused, 1, 1));
+    };
+    for (const auto initial_and_step :
+         {std::pair<double, double>{1.3, .5},
+          std::pair<double, double>{1.000000109999956, .025}}) {
+      const double initial = initial_and_step.first;
+      const double h = initial_and_step.second;
+      double y = initial, f0, jac_buf;
+      GRIMPL_NS::View<double**> jac(&jac_buf, 1, 1);
+      rhs(&y, &f0, jac);
+      GRIMPL_NS::integrate::StiffNewtonRaphson solver(1, 1.e-6, 20);
+      std::vector<double> scratch(solver.num_scratch_buf_elements());
+      const double atol = 1.e-17;
+      const auto result = solver.step_modified(
+        &y, h, calc_f, rhs, 1, scratch.data(), &atol, &jac, &f0, true);
+      ASSERT_TRUE(result.converged()) << "smooth=" << smooth << " h=" << h;
+      double f_end;
+      calc_f(&y, &f_end);
+      const double residual = y - initial - h * f_end;
+      EXPECT_LE(std::fabs(residual), 2.e-6 * (std::fabs(y) + initial))
+        << "smooth=" << smooth << " h=" << h;
+      // Both roots are below the transition, where f = -1 (to roundoff
+      // also in the smooth case).
+      EXPECT_NEAR(y, initial - h, 5.e-6);
+    }
+  }
+}
+
+TEST(AdaptiveBackwardEuler, SteepToConstantCoolingTrajectoryRemainsAccurate) {
+  for (bool smooth : {false, true}) {
+    for (double initial : {1.3, 1.0000005}) {
+      ConstantCoolingTail rhs{smooth};
+      // Keep the production nonlinear tolerance, with a tighter local
+      // integration tolerance for comparison to the full analytic trajectory.
+      GRIMPL_NS::integrate::AdaptiveBackwardEuler solver(
+        1, 1.e-4, .1, 40, 1.e-6);
+      std::vector<double> scratch(solver.num_scratch_buf_elements());
+      const double atol = 1.e-13;
+      double y = initial, elapsed = 0., proposal = .5;
+      int steps = 0;
+      while (elapsed < .5 && steps < 1000) {
+        const double floor = std::max(1.e-18, std::nextafter(
+          elapsed, std::numeric_limits<double>::infinity()) - elapsed);
+        const auto result = solver.step(
+          &y, std::min(proposal, .5 - elapsed), floor, rhs, 1, 0,
+          &atol, scratch.data());
+        ASSERT_TRUE(result.converged())
+          << "smooth=" << smooth << " initial=" << initial
+          << " elapsed=" << elapsed;
+        ASSERT_GT(result.accepted_dt, 0.);
+        EXPECT_LE(result.error_norm, 1.);
+        elapsed += result.accepted_dt;
+        proposal = result.suggested_dt;
+        ++steps;
+      }
+      ASSERT_LT(steps, 1000);
+      EXPECT_DOUBLE_EQ(elapsed, .5);
+      // Above y=1, x'=-(1+rate*x); below it, y'=-1. The time to reach
+      // y=1 is log(1+rate*(initial-1))/rate. Softening a width of 1e-10
+      // changes this reference by far less than the integration tolerance.
+      const double crossing_time =
+        std::log1p(ConstantCoolingTail::rate * (initial - 1.)) /
+        ConstantCoolingTail::rate;
+      const double expected = .5 + crossing_time;
+      EXPECT_NEAR(y, expected, 1.e-3)
+        << "smooth=" << smooth << " initial=" << initial;
+    }
+  }
+}
+
+TEST(AdaptiveBackwardEuler, ThermalGuardUsesDerivativeAtReturnedEndpoint) {
+  const auto rhs = [](const double* y, double* f,
+                      GRIMPL_NS::View<double**> jac) {
+    const double threshold = 1. + 4.e-7;
+    f[0] = 1.e-6 + std::max(y[0] - threshold, 0.);
+    jac(0, 0) = y[0] > threshold ? 1. : 0.;
+  };
+  GRIMPL_NS::integrate::AdaptiveBackwardEuler solver(
+    1, 1.e-3, .1, 40, 1.e-6);
+  std::vector<double> scratch(solver.num_scratch_buf_elements());
+  const double atol = 1.e-13;
+  double y = 1.;
+  const auto result = solver.step(
+    &y, 1., 1.e-14, rhs, 1, 0, &atol, scratch.data());
+  ASSERT_TRUE(result.converged());
+  double f_end, actual_j;
+  rhs(&y, &f_end, GRIMPL_NS::View<double**>(&actual_j, 1, 1));
+  // A tiny last correction can cross the threshold. Using its pre-correction
+  // J=0 used to accept h=1 even though the returned state's J=1.
+  EXPECT_LT(result.accepted_dt, 1.);
+  EXPECT_LE(result.accepted_dt * std::max(0., actual_j), .1 * (1. + 1.e-12));
+}
+
+TEST(AdaptiveBackwardEuler, NonfiniteReturnedEndpointFailsWithoutCommit) {
+  for (double invalid : {std::numeric_limits<double>::quiet_NaN(),
+                         std::numeric_limits<double>::infinity()}) {
+    const auto rhs = [invalid](const double* y, double* f,
+                              GRIMPL_NS::View<double**> jac) {
+      f[0] = y[0] > 1. + 8.e-7 ? invalid : 1.e-6;
+      jac(0, 0) = 0.;
+    };
+    GRIMPL_NS::integrate::AdaptiveBackwardEuler solver(
+      1, 1.e-3, .1, 40, 1.e-6);
+    std::vector<double> scratch(solver.num_scratch_buf_elements());
+    const double atol = 1.e-13;
+    double y = 1.;
+    // Every allowed substep reaches the invalid domain; a shorter retry is
+    // below the caller's progress floor. The original input must survive.
+    const auto result = solver.step(
+      &y, 1., .9, rhs, 1, 0, &atol, scratch.data());
+    EXPECT_FALSE(result.converged());
+    EXPECT_EQ(result.accepted_dt, 0.);
+    EXPECT_EQ(y, 1.);
+  }
+}
+
+TEST(AdaptiveBackwardEuler, FloatQuantizedStiffRelaxationAcceptsLargeStep) {
+  // The continuous BE root is less than one float ULP above equilibrium.
+  // No solution of y-y0-h*f(float(y)) exists in that rounding bin: requiring
+  // a zero unscaled residual would turn this stable relaxation into tiny steps.
+  const auto rhs = [](const double* y, double* f,
+                      GRIMPL_NS::View<double**> jac) {
+    f[0] = 1. - static_cast<double>(static_cast<float>(y[0]));
+    jac(0, 0) = -1.;
+  };
+  constexpr double precision = std::numeric_limits<float>::epsilon();
+  constexpr double denormal = std::numeric_limits<float>::denorm_min();
+  GRIMPL_NS::integrate::AdaptiveBackwardEuler solver(
+    1, 1.e-3, .1, 40, 32. * precision, 1.e-2, precision, denormal);
+  std::vector<double> scratch(solver.num_scratch_buf_elements());
+  const double atol = 1.e-13;
+  const double initial = static_cast<double>(1.01f);
+  double y = initial;
+  const auto result = solver.step(
+    &y, 1.e8, 1.e-14, rhs, 1, 0, &atol, scratch.data());
+  ASSERT_TRUE(result.converged());
+  EXPECT_EQ(result.accepted_dt, 1.e8);
+  EXPECT_LE(result.retries, 1);
+  EXPECT_LE(result.newton_iterations, 60);
+  EXPECT_NEAR(y, 1., 4. * precision);
+  EXPECT_LE(result.error_norm, 1.);
+}
+
+TEST(StiffNewtonRaphson, FloatRoundoffCannotHideWrongSideOfCoolingTransition) {
+  constexpr double precision = std::numeric_limits<float>::epsilon();
+  constexpr double denormal = std::numeric_limits<float>::denorm_min();
+  for (bool finite_difference : {false, true}) {
+    const auto calc_f = [](const double* y, double* f) {
+      const double stored = static_cast<double>(static_cast<float>(y[0]));
+      f[0] = -1. - 1.e8 * std::max(stored - 1., 0.);
+    };
+    const auto rhs = [&](const double* y, double* f,
+                         GRIMPL_NS::View<double**> jac) {
+      calc_f(y, f);
+      const double stored = static_cast<double>(static_cast<float>(y[0]));
+      if (finite_difference) {
+        // Match the production float Jacobian perturbation and denominator.
+        // Its wide probe can straddle the transition even when y is on the
+        // flat side, so |J|*epsilon alone is not a safe residual allowance.
+        const double perturbed = static_cast<double>(static_cast<float>(
+          stored + 1.e-2 * std::max(std::fabs(stored), 1.e-40)));
+        double offset_f;
+        calc_f(&perturbed, &offset_f);
+        jac(0, 0) = (offset_f - f[0]) / (perturbed - stored);
+      } else {
+        jac(0, 0) = stored > 1. ? -1.e8 : 0.;
+      }
+    };
+    const double initial = static_cast<double>(
+      static_cast<float>(1.000000109999956));
+    constexpr double h = .025;
+    double y = initial, f0, jac_buf;
+    GRIMPL_NS::View<double**> jac(&jac_buf, 1, 1);
+    rhs(&y, &f0, jac);
+    GRIMPL_NS::integrate::StiffNewtonRaphson solver(
+      1, 32. * precision, 20, precision, denormal);
+    std::vector<double> scratch(solver.num_scratch_buf_elements());
+    const double atol = 1.e-17;
+    const auto result = solver.step_modified(
+      &y, h, calc_f, rhs, 1, scratch.data(), &atol, &jac, &f0, true);
+    // A forward-difference Jacobian across this sharp artificial feature may
+    // need a smaller substep. Failure is safe; accepting y~1 with residual
+    // ~0.025 is not. The analytic Jacobian should solve this simple case.
+    if (!finite_difference) { ASSERT_TRUE(result.converged()); }
+    if (result.converged()) {
+      double f_end;
+      calc_f(&y, &f_end);
+      const double residual = y - initial - h * f_end;
+      EXPECT_NEAR(y, initial - h, 1.e-5)
+        << "finite_difference=" << finite_difference;
+      EXPECT_LE(std::fabs(residual), 64. * precision * initial)
+        << "finite_difference=" << finite_difference;
+    }
+  }
+}
+
+TEST(AdaptiveBackwardEuler, FloatQuantizedCoupledRelaxationPreservesInvariant) {
+  // Quantization of both reacting abundances leaves a gap around the exact
+  // BE root. A common rounding-neighborhood solution must retain their sum.
+  const auto rhs = [](const double* y, double* f,
+                      GRIMPL_NS::View<double**> jac) {
+    const double left = static_cast<double>(static_cast<float>(y[0]));
+    const double right = static_cast<double>(static_cast<float>(y[1]));
+    f[0] = right - left;
+    f[1] = -f[0];
+    jac(0, 0) = jac(1, 1) = -1.;
+    jac(0, 1) = jac(1, 0) = 1.;
+  };
+  constexpr double precision = std::numeric_limits<float>::epsilon();
+  constexpr double denormal = std::numeric_limits<float>::denorm_min();
+  GRIMPL_NS::integrate::AdaptiveBackwardEuler solver(
+    2, 1.e-3, .1, 40, 32. * precision, 1.e-2, precision, denormal);
+  std::vector<double> scratch(solver.num_scratch_buf_elements());
+  const double atol[] = {1.e-13, 1.e-13};
+  double y[] = {static_cast<double>(1.01f), static_cast<double>(.99f)};
+  const double initial_sum = y[0] + y[1];
+  const auto result = solver.step(
+    y, 1.e8, 1.e-14, rhs, 2, -1, atol, scratch.data());
+  ASSERT_TRUE(result.converged());
+  EXPECT_EQ(result.accepted_dt, 1.e8);
+  EXPECT_LE(result.retries, 1);
+  EXPECT_LE(result.newton_iterations, 60);
+  EXPECT_NEAR(y[0], .5 * initial_sum, 4. * precision);
+  EXPECT_NEAR(y[1], .5 * initial_sum, 4. * precision);
+  EXPECT_NEAR(y[0] + y[1], initial_sum, 1.e-9);
+}
+
+TEST(StiffNewtonRaphson, FloatRoundingRequiresACommonCoupledSolution) {
+  // Around (1,1), both equations share K*(q0-q1), but their residuals
+  // have opposite offsets. Each row separately brackets zero in the ULP
+  // box, at incompatible values of q0-q1. A wide production-style finite
+  // difference also sees the stiff cutoff at 1.005, making the fresh Newton
+  // correction misleadingly tiny. A common solution of the local residual
+  // equations is necessary before accepting the rounding allowance.
+  const auto calc_f = [](const double* y, double* f) {
+    const double left = static_cast<double>(static_cast<float>(y[0]));
+    const double right = static_cast<double>(static_cast<float>(y[1]));
+    f[0] = 1.e7 * (left - right) + 1.
+           - 1.e12 * std::max(left - 1.005, 0.);
+    f[1] = 1.e7 * (left - right) - 1.
+           - 1.e12 * std::max(right - 1.005, 0.);
+  };
+  const auto rhs = [&](const double* y, double* f,
+                       GRIMPL_NS::View<double**> jac) {
+    calc_f(y, f);
+    for (int j = 0; j < 2; ++j) {
+      const double base = static_cast<double>(static_cast<float>(y[j]));
+      double perturbed[] = {y[0], y[1]}, offset_f[2];
+      perturbed[j] = static_cast<double>(static_cast<float>(
+        base + 1.e-2 * std::max(std::fabs(base), 1.e-10)));
+      calc_f(perturbed, offset_f);
+      for (int i = 0; i < 2; ++i) {
+        jac(i, j) = (offset_f[i] - f[i]) / (perturbed[j] - base);
+      }
+    }
+  };
+  constexpr double precision = std::numeric_limits<float>::epsilon();
+  constexpr double denormal = std::numeric_limits<float>::denorm_min();
+  GRIMPL_NS::integrate::StiffNewtonRaphson solver(
+    2, 32. * precision, 20, precision, denormal);
+  std::vector<double> scratch(solver.num_scratch_buf_elements());
+  double y[] = {1., 1.}, f0[2], jac_buf[4];
+  const double atol[] = {1.e-17, 1.e-17};
+  GRIMPL_NS::View<double**> jac(jac_buf, 2, 2);
+  rhs(y, f0, jac);
+  const auto result = solver.step_modified(
+    y, 1., calc_f, rhs, 2, scratch.data(), atol, &jac, f0, true);
+  // Failure permits the adaptive caller to shorten the step. If a future
+  // solver does converge at h=1, the actual BE root is near the cutoff,
+  // (1.005, 1.0049999), not the false rounding-limited state near (1,1).
+  if (result.converged()) {
+    EXPECT_NEAR(y[0], 1.005, 1.e-5);
+    EXPECT_NEAR(y[1], 1.005, 1.e-5);
   }
 }

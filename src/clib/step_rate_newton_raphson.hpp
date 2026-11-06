@@ -224,8 +224,14 @@ inline bool step_rate_newton_raphson(
   // Resolve finite differences above the precision of the RHS fields.
   constexpr double eps = (std::numeric_limits<gr_float>::digits <
                           std::numeric_limits<double>::digits) ? 1.e-2 : 1.e-4;
+  // The endpoint residual also accounts for input quantization: an exact
+  // backward-Euler root need not exist after casting trial states to gr_float.
+  // The solver verifies a nearby root of sampled residuals within a few ULPs;
+  // it never grants a residual allowance proportional to stiffness alone.
   integrate::AdaptiveBackwardEuler ode_solver(
-    i_eng, relative_tolerance, 0.1, 40, nonlinear_tolerance, eps);
+    i_eng, relative_tolerance, 0.1, 40, nonlinear_tolerance, eps,
+    std::numeric_limits<gr_float>::epsilon(),
+    std::numeric_limits<gr_float>::denorm_min());
 
   std::vector<double> ode_scratch_buf(ode_solver.num_scratch_buf_elements());
 
