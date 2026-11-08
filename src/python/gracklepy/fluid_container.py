@@ -17,6 +17,7 @@ import warnings
 
 from gracklepy.grackle_wrapper import \
     calculate_cooling_rate_contributions, \
+    calculate_metal_reaction_fluxes, \
     calculate_cooling_time, \
     calculate_gamma, \
     calculate_pressure, \
@@ -77,7 +78,7 @@ _species_info = {
     "COII": {"C": 1, "O": 1},
     "OII": {"O": 1},
     "OHII": {"O": 1, "H": 1},
-    "H2OII": {"H": 1, "O": 1},
+    "H2OII": {"H": 2, "O": 1},
     "H3OII": {"H": 3, "O": 1},
     "O2II": {"O": 2},
     "e": {"e": 1},
@@ -667,6 +668,16 @@ class FluidContainer(dict):
 
     def calculate_cooling_rate_contributions(self, my_dt=0.0):
         return calculate_cooling_rate_contributions(self, my_dt)
+
+    def calculate_metal_reaction_fluxes(self, my_dt=0.0):
+        """Calculate gross event fluxes for the explicit metal network.
+
+        Returns a dict with the 48 channel names listed by
+        ``gracklepy.METAL_REACTION_FLUX_FIELDS`` and an ``active`` boolean
+        mask. Channel values are physical event fluxes in cm**-3*s**-1. They
+        are instantaneous diagnostics and do not advance this container.
+        """
+        return calculate_metal_reaction_fluxes(self, my_dt)
 
     def calculate_gamma(self):
         calculate_gamma(self)

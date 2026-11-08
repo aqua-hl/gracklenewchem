@@ -25,6 +25,8 @@ from libc.stdint cimport int64_t
 from libc.stdlib cimport malloc, free
 from .grackle_defs cimport *
 import numpy as np
+from gracklepy.metal_reaction_diagnostics import \
+    METAL_REACTION_OUTPUT_FIELDS as _metal_reaction_flux_output_fields
 
 # define a set of rate-related properties that the chemistry_data extension
 # type must support as attributes:
@@ -962,6 +964,47 @@ def calculate_cooling_rate_contributions(fc, my_dt=0.0):
     if (ret == GRACKLE_FAIL_VALUE):
         raise RuntimeError(
             "Error occured within local_calculate_cooling_rate_contributions")
+    return output
+
+def calculate_metal_reaction_fluxes(fc, my_dt=0.0):
+    """Return instantaneous explicit-metal reaction event fluxes.
+
+    Each reaction channel is in physical ``cm**-3*s**-1``. ``active`` is a
+    boolean mask identifying cells in which the explicit metal network would
+    run. Channel ordering and stoichiometry are available from
+    ``gracklepy.metal_reaction_catalog()``.
+    """
+    cdef chemistry_data chem_data = fc.chemistry_data
+    cdef c_chemistry_data my_chemistry = chem_data.data.data
+    cdef c_chemistry_data_storage my_rates = chem_data.rates
+    cdef c_code_units my_units = chem_data.units
+    cdef double dt_value = <double> my_dt
+
+    cdef int buf[7]
+    cdef c_field_data my_fields = setup_field_data(fc, buf, True)
+    cdef c_grackle_metal_reaction_flux_data reaction_flux_fields
+    cdef dict output = {
+        name: np.zeros(fc["density"].shape, dtype=fc["density"].dtype)
+        for name in _metal_reaction_flux_output_fields
+    }
+
+    if sizeof(reaction_flux_fields) != \
+            len(_metal_reaction_flux_output_fields) * sizeof(gr_float*):
+        raise RuntimeError(
+            "metal-reaction flux field table is out of sync with the C "
+            "grackle_metal_reaction_flux_data struct")
+    cdef gr_float** field_ptrs = <gr_float**> &reaction_flux_fields
+    cdef int field_index
+    for field_index, name in enumerate(_metal_reaction_flux_output_fields):
+        field_ptrs[field_index] = get_array_field(output[name])
+
+    cdef int ret = c_local_calculate_metal_reaction_fluxes(
+        &my_chemistry, &my_rates, &my_units, &my_fields, dt_value,
+        &reaction_flux_fields)
+    if (ret == GRACKLE_FAIL_VALUE):
+        raise RuntimeError(
+            "Error occured within local_calculate_metal_reaction_fluxes")
+    output["active"] = output["active"].astype(bool)
     return output
 
 def calculate_gamma(fc):

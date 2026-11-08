@@ -118,7 +118,7 @@
 /// | kz46      | H2OII  +  e    ->  OH     +  HI  |
 /// | kz47      | H2OII  +  e    ->  OI     +  H2I |
 /// | kz48      | H3OII  +  e    ->  H2O    +  HI  |
-/// | kz49      | H3OII  +  e    ->  OH     +  HI  |
+/// | kz49      | H3OII  +  e    ->  OH     +  2 HI |
 /// | kz50      | O2II   +  e    ->  OI     +  OI  |
 /// | kz51      | H2I    +  CI   ->  CH2    +  p   |
 /// | kz52      | SiI    +  OH   ->  SiOI   +  HI  |

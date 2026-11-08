@@ -87,6 +87,7 @@ add_library(Grackle_Grackle
 
   # C++ Source (and Private Header Files)
   api/calculate_cooling_rate_contributions.cpp
+  api/calculate_metal_reaction_fluxes.cpp
   api/calculate_cooling_time.cpp
   api/calculate_dust_temperature.cpp
   api/calculate_T_related.cpp
@@ -134,6 +135,9 @@ add_library(Grackle_Grackle
   interpolate.hpp
   lnT_prep.cpp lnT_prep.hpp
   lookup_cool_rates1d.hpp
+  metal_reaction_catalog.def
+  metal_reaction_catalog.hpp
+  metal_reaction_fluxes.hpp
   make_consistent.cpp make_consistent.hpp
   mask.hpp
   math/gaussj.cpp math/gaussj.hpp

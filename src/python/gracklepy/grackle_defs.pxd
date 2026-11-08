@@ -228,6 +228,12 @@ cdef extern from "grackle.h":
     ctypedef struct c_grackle_cooling_rate_contribution_data "grackle_cooling_rate_contribution_data":
       pass
 
+    # Opaque for the same reason as the cooling-contribution struct. The final
+    # pointer is the active mask; all preceding pointers follow the public
+    # GRACKLE_METAL_REACTION_FLUX_CHANNELS macro order.
+    ctypedef struct c_grackle_metal_reaction_flux_data "grackle_metal_reaction_flux_data":
+      pass
+
 
     # defined in "grackle.h"
     # ----------------------
@@ -286,6 +292,14 @@ cdef extern from "grackle.h":
                 c_field_data *my_fields,
                 double dt_value,
                 c_grackle_cooling_rate_contribution_data *contributions)
+
+    int c_local_calculate_metal_reaction_fluxes "local_calculate_metal_reaction_fluxes"(
+                c_chemistry_data *my_chemistry,
+                c_chemistry_data_storage *my_rates,
+                c_code_units *my_units,
+                c_field_data *my_fields,
+                double dt_value,
+                c_grackle_metal_reaction_flux_data *fluxes)
 
     int c_local_calculate_gamma "local_calculate_gamma"(
                 c_chemistry_data *my_chemistry,

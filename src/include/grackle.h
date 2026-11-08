@@ -162,6 +162,81 @@ int local_calculate_cooling_rate_contributions(
     double dt_value,
     grackle_cooling_rate_contribution_data *contributions);
 
+// X-macro: channels returned by the experimental metal-reaction gross-flux
+// diagnostic. Every value is an event flux in physical units of cm^-3 s^-1.
+// A reaction that consumes two identical reactants (kz25 and kz31) follows
+// the solver's convention, Phi = k n^2, without an extra factor of one half.
+#define GRACKLE_METAL_REACTION_FLUX_CHANNELS(GR_F)                             \
+  GR_F(Kz15, kz15)                                                            \
+  GR_F(Kz16, kz16)                                                            \
+  GR_F(Kz17, kz17)                                                            \
+  GR_F(Kz18, kz18)                                                            \
+  GR_F(Kz19, kz19)                                                            \
+  GR_F(Kz20, kz20)                                                            \
+  GR_F(Kz21, kz21)                                                            \
+  GR_F(Kz22, kz22)                                                            \
+  GR_F(Kz23, kz23)                                                            \
+  GR_F(Kz24, kz24)                                                            \
+  GR_F(Kz25, kz25)                                                            \
+  GR_F(Kz26, kz26)                                                            \
+  GR_F(Kz27, kz27)                                                            \
+  GR_F(Kz28, kz28)                                                            \
+  GR_F(Kz29, kz29)                                                            \
+  GR_F(Kz30, kz30)                                                            \
+  GR_F(Kz31, kz31)                                                            \
+  GR_F(Kz32, kz32)                                                            \
+  GR_F(Kz33, kz33)                                                            \
+  GR_F(Kz34, kz34)                                                            \
+  GR_F(Kz35, kz35)                                                            \
+  GR_F(Kz36, kz36)                                                            \
+  GR_F(Kz37, kz37)                                                            \
+  GR_F(Kz38, kz38)                                                            \
+  GR_F(Kz39, kz39)                                                            \
+  GR_F(Kz40, kz40)                                                            \
+  GR_F(Kz41, kz41)                                                            \
+  GR_F(Kz42, kz42)                                                            \
+  GR_F(Kz43, kz43)                                                            \
+  GR_F(Kz44, kz44)                                                            \
+  GR_F(Kz45, kz45)                                                            \
+  GR_F(Kz46, kz46)                                                            \
+  GR_F(Kz47, kz47)                                                            \
+  GR_F(Kz48, kz48)                                                            \
+  GR_F(Kz49, kz49)                                                            \
+  GR_F(Kz50, kz50)                                                            \
+  GR_F(Kz51, kz51)                                                            \
+  GR_F(Kz52, kz52)                                                            \
+  GR_F(Kz53, kz53)                                                            \
+  GR_F(Kz54, kz54)                                                            \
+  GR_F(KphCIBackground, kphCI_bg)                                             \
+  GR_F(KphOIBackground, kphOI_bg)                                             \
+  GR_F(KdissCOBackground, kdissCO_bg)                                         \
+  GR_F(KdissOHBackground, kdissOH_bg)                                         \
+  GR_F(KdissH2OBackground, kdissH2O_bg)                                       \
+  GR_F(KphCIRadiativeTransfer, kphCI_rt)                                      \
+  GR_F(KphOIRadiativeTransfer, kphOI_rt)                                      \
+  GR_F(KdissCORadiativeTransfer, kdissCO_rt)                                  \
+  GR_F(KdissOHRadiativeTransfer, kdissOH_rt)                                  \
+  GR_F(KdissH2ORadiativeTransfer, kdissH2O_rt)
+
+typedef struct {
+#define GRACKLE_METAL_REACTION_FLUX_DECL(enum_suffix, field) gr_float *field;
+  GRACKLE_METAL_REACTION_FLUX_CHANNELS(GRACKLE_METAL_REACTION_FLUX_DECL)
+#undef GRACKLE_METAL_REACTION_FLUX_DECL
+  // 1 where the metal network is active for a cell, otherwise 0. This is
+  // separate from the channel macro because it is not a flux.
+  gr_float *active;
+} grackle_metal_reaction_flux_data;
+
+/// Evaluate instantaneous gross metal-reaction event fluxes for the supplied
+/// state without advancing it. Output channels have units cm^-3 s^-1.
+int local_calculate_metal_reaction_fluxes(
+    chemistry_data *my_chemistry,
+    chemistry_data_storage *my_rates,
+    code_units *my_units,
+    grackle_field_data *my_fields,
+    double dt_value,
+    grackle_metal_reaction_flux_data *fluxes);
+
 int calculate_dust_temperature(code_units *my_units,
                                grackle_field_data *my_fields,
                                gr_float *dust_temperature);

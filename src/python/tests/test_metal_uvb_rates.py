@@ -61,6 +61,10 @@ RATIO_ATOL = 2.0e-3
 # settles, so its ratio comparisons get a little more headroom
 CO_RATIO_ATOL = 5.0e-3
 
+# Native and Python helpers retain slightly different historical hydrogen-mass
+# constants, so physical flux comparisons need per-mille relative tolerance.
+FLUX_RTOL = 2.0e-3
+
 
 def make_table_with_rates(tmp_path, k_ci, k_oi, k_co=0.0, base=STOCK_TABLE):
     """Copy a stock UV background table and add constant kphCI/kphOI/
@@ -76,7 +80,8 @@ def make_table_with_rates(tmp_path, k_ci, k_oi, k_co=0.0, base=STOCK_TABLE):
 
 
 def setup_fluid_container(data_file, use_rt=False, rt_ci=0.0, rt_oi=0.0,
-                          rt_co=0.0, self_shielding=0, density_factor=1.0):
+                          rt_co=0.0, self_shielding=0, density_factor=1.0,
+                          n_vals=1):
     """Return an initialized (chemistry_data, FluidContainer) pair with
     metal_chemistry enabled, the UV background on, and (optionally) the
     radiative-transfer metal rates set (in 1/s)."""
@@ -94,8 +99,12 @@ def setup_fluid_container(data_file, use_rt=False, rt_ci=0.0, rt_oi=0.0,
     my_chemistry.self_shielding_method = self_shielding
     if use_rt:
         my_chemistry.use_radiative_transfer = 1
-        my_chemistry.radiative_transfer_metal_ionization = 1
-        my_chemistry.radiative_transfer_metal_dissociation = 1
+        my_chemistry.use_photo_fields = 1
+        my_chemistry.use_CI_ionization = 3
+        my_chemistry.use_OI_ionization = 3
+        my_chemistry.use_COI_dissociation = 3
+        my_chemistry.use_OHI_dissociation = 3
+        my_chemistry.use_H2OI_dissociation = 3
 
     # Set units (proper frame, z = 0)
     my_chemistry.comoving_coordinates = 0
@@ -108,7 +117,7 @@ def setup_fluid_container(data_file, use_rt=False, rt_ci=0.0, rt_oi=0.0,
 
     assert my_chemistry.initialize() == 1
 
-    fc = FluidContainer(my_chemistry, n_vals=1)
+    fc = FluidContainer(my_chemistry, n_vals=n_vals)
     fc["density"][:] = density_factor
     fc["HI_density"][:] = 1.0e-4 * density_factor
     fc["HII_density"][:] = (0.759 - 1.0e-4) * density_factor
@@ -123,19 +132,19 @@ def setup_fluid_container(data_file, use_rt=False, rt_ci=0.0, rt_oi=0.0,
     fc["metal_density"][:] = 1.0e-3 * density_factor
     fc["CI_density"][:] = 1.0e-6 * density_factor
     fc["OI_density"][:] = 1.0e-6 * density_factor
-    fc["CO_density"][:] = 1.0e-6 * density_factor
+    fc["COI_density"][:] = 1.0e-6 * density_factor
     fc["internal_energy"][:] = \
         1.0e13 / my_chemistry.get_velocity_units() ** 2 * 1.0e4
     if use_rt:
-        for name in ("RT_heating_rate", "RT_HI_ionization_rate",
-                     "RT_HeI_ionization_rate", "RT_HeII_ionization_rate",
-                     "RT_H2_dissociation_rate", "RT_OH_dissociation_rate",
-                     "RT_H2O_dissociation_rate"):
+        for name in ("RT_heating_rate", "HI_ionization_rate",
+                     "HeI_ionization_rate", "HeII_ionization_rate",
+                     "H2I_dissociation_rate", "OHI_dissociation_rate",
+                     "H2OI_dissociation_rate"):
             fc[name][:] = 0.0
         # the RT rate fields are in code units (1 / time_units)
-        fc["RT_CI_ionization_rate"][:] = rt_ci * my_chemistry.time_units
-        fc["RT_OI_ionization_rate"][:] = rt_oi * my_chemistry.time_units
-        fc["RT_CO_dissociation_rate"][:] = rt_co * my_chemistry.time_units
+        fc["CI_ionization_rate"][:] = rt_ci * my_chemistry.time_units
+        fc["OI_ionization_rate"][:] = rt_oi * my_chemistry.time_units
+        fc["COI_dissociation_rate"][:] = rt_co * my_chemistry.time_units
     return my_chemistry, fc
 
 
@@ -185,6 +194,113 @@ def expected_ratio(k_total):
     return 1.0 / (1.0 + k_total * DT_SECONDS)
 
 
+def test_metal_reaction_flux_diagnostic(tmp_path):
+    """The diagnostic reports post-lookup UVB, RT, and binary fluxes."""
+    metal_table = make_table_with_rates(
+        tmp_path, K_UVB_CI, K_UVB_OI, k_co=K_UVB_CO
+    )
+    my_chemistry, fc = setup_fluid_container(
+        metal_table, use_rt=True, rt_ci=K_RT_CI, rt_oi=K_RT_OI,
+        rt_co=K_RT_CO,
+    )
+    fc["OHI_density"][:] = 2.0e-6
+    fluxes = fc.calculate_metal_reaction_fluxes()
+
+    number_unit = my_chemistry.density_units / mass_hydrogen_cgs
+    n_ci = fc["CI_density"][0] * number_unit / 12.0
+    n_oi = fc["OI_density"][0] * number_unit / 16.0
+    n_co = fc["COI_density"][0] * number_unit / 28.0
+
+    assert fluxes["active"].dtype == np.bool_
+    assert fluxes["active"][0]
+    # Since the UVB/RT summation refactor the solver applies one total photo
+    # rate per channel; the *_bg diagnostic reports that applied total
+    # (UV background plus any local RT), while *_rt still reports the RT
+    # field contribution on its own.
+    assert np.isclose(
+        fluxes["kphCI_bg"][0], (K_UVB_CI + K_RT_CI) * n_ci,
+        rtol=FLUX_RTOL, atol=0.0,
+    )
+    assert np.isclose(
+        fluxes["kphOI_bg"][0], (K_UVB_OI + K_RT_OI) * n_oi,
+        rtol=FLUX_RTOL, atol=0.0,
+    )
+    assert np.isclose(
+        fluxes["kdissCO_bg"][0], (K_UVB_CO + K_RT_CO) * n_co,
+        rtol=FLUX_RTOL, atol=0.0,
+    )
+    assert np.isclose(
+        fluxes["kphCI_rt"][0], K_RT_CI * n_ci,
+        rtol=FLUX_RTOL, atol=0.0,
+    )
+    assert np.isclose(
+        fluxes["kphOI_rt"][0], K_RT_OI * n_oi,
+        rtol=FLUX_RTOL, atol=0.0,
+    )
+    assert np.isclose(
+        fluxes["kdissCO_rt"][0], K_RT_CO * n_co,
+        rtol=FLUX_RTOL, atol=0.0,
+    )
+
+    # kz15 is temperature independent. This directly checks the conversion
+    # from code mass densities to a physical gross event flux.
+    n_hi = fc["HI_density"][0] * number_unit
+    n_ch = fc["CHI_density"][0] * number_unit / 13.0
+    assert np.isclose(
+        fluxes["kz15"][0], 4.98e-11 * n_hi * n_ch,
+        rtol=FLUX_RTOL, atol=0.0,
+    )
+
+    # The solver convention for two identical reactants is k*n**2, without a
+    # combinatorial 1/2. Reconstruct its exact log-temperature interpolation.
+    fc.calculate_temperature()
+    log_temperature_grid = np.linspace(
+        np.log(my_chemistry.TemperatureStart),
+        np.log(my_chemistry.TemperatureEnd),
+        my_chemistry.NumberOfTemperatureBins,
+    )
+    kz25_code = np.interp(
+        np.log(fc["temperature"][0]), log_temperature_grid,
+        np.asarray(my_chemistry.kz25),
+    )
+    k_unit = mass_hydrogen_cgs / (
+        my_chemistry.density_units * my_chemistry.time_units
+    )
+    n_oh = fc["OHI_density"][0] * number_unit / 17.0
+    assert np.isclose(
+        fluxes["kz25"][0], kz25_code * k_unit * n_oh**2,
+        rtol=FLUX_RTOL, atol=0.0,
+    )
+
+    # The activity mask follows the solver's minimum-metallicity cut, and no
+    # stale values may leak through for excluded cells.
+    fc["metal_density"][:] = 0.0
+    inactive_fluxes = fc.calculate_metal_reaction_fluxes()
+    assert not inactive_fluxes["active"][0]
+    assert all(
+        inactive_fluxes[channel][0] == 0.0
+        for channel in inactive_fluxes if channel != "active"
+    )
+
+
+def test_metal_reaction_flux_vector_layout(tmp_path):
+    metal_table = make_table_with_rates(tmp_path, K_UVB_CI, 0.0)
+    my_chemistry, fc = setup_fluid_container(metal_table, n_vals=3)
+    fc["CI_density"][:] = (1.2e-6, 2.4e-6, 3.6e-6)
+    fc["metal_density"][:] = (1.0e-3, 0.0, 1.0e-3)
+
+    fluxes = fc.calculate_metal_reaction_fluxes()
+    number_unit = my_chemistry.density_units / mass_hydrogen_cgs
+    expected = K_UVB_CI * fc["CI_density"] * number_unit / 12.0
+
+    assert np.array_equal(fluxes["active"], (True, False, True))
+    assert np.allclose(
+        fluxes["kphCI_bg"][[0, 2]], expected[[0, 2]],
+        rtol=FLUX_RTOL, atol=0.0,
+    )
+    assert fluxes["kphCI_bg"][1] == 0.0
+
+
 def test_uvb_metal_photoionization(tmp_path):
     # a table with kphCI/kphOI datasets must ionize C I and O I at the
     # tabulated rates; normalizing by an otherwise-identical run without
@@ -206,11 +322,11 @@ def test_uvb_co_photodissociation(tmp_path):
     # and hand the fragments to the same network terms as the established
     # RT dissociation path
     co_table = make_table_with_rates(tmp_path, 0.0, 0.0, k_co=K_UVB_CO)
-    species = ("CO", "CI", "OI")
+    species = ("COI", "CI", "OI")
 
-    base = evolve_ratios(STOCK_TABLE, species=("CO",), spin_up=True,
+    base = evolve_ratios(STOCK_TABLE, species=("COI",), spin_up=True,
                          density_factor=LOW_DENSITY)
-    uvb = evolve_ratios(co_table, species=("CO",), spin_up=True,
+    uvb = evolve_ratios(co_table, species=("COI",), spin_up=True,
                         density_factor=LOW_DENSITY)
     assert np.isclose(uvb[0] / base[0], expected_ratio(K_UVB_CO),
                       rtol=0.0, atol=CO_RATIO_ATOL)
@@ -266,12 +382,12 @@ def test_rt_and_uvb_rates_are_summed(tmp_path):
 
     # same for CO
     co_table = make_table_with_rates(tmp_path, 0.0, 0.0, k_co=K_UVB_CO)
-    co_base = evolve_ratios(STOCK_TABLE, species=("CO",), use_rt=True,
+    co_base = evolve_ratios(STOCK_TABLE, species=("COI",), use_rt=True,
                             spin_up=True, density_factor=LOW_DENSITY)
-    co_rt = evolve_ratios(STOCK_TABLE, species=("CO",), use_rt=True,
+    co_rt = evolve_ratios(STOCK_TABLE, species=("COI",), use_rt=True,
                           rt_co=K_RT_CO,
                           spin_up=True, density_factor=LOW_DENSITY)
-    co_both = evolve_ratios(co_table, species=("CO",), use_rt=True,
+    co_both = evolve_ratios(co_table, species=("COI",), use_rt=True,
                             rt_co=K_RT_CO,
                             spin_up=True, density_factor=LOW_DENSITY)
     assert np.isclose(co_rt[0] / co_base[0], expected_ratio(K_RT_CO),
@@ -325,3 +441,18 @@ def test_oi_shielded_ci_optically_thin(tmp_path):
     suppression = (1.0 - measured) / (1.0 - oi_thin)
     assert measured > oi_thin
     assert suppression < 0.5
+
+    # The diagnostic must expose the same post-shielding buffer used above,
+    # rather than the raw table scalar.
+    my_chemistry, fc = setup_fluid_container(
+        metal_table, self_shielding=3
+    )
+    fluxes = fc.calculate_metal_reaction_fluxes()
+    number_unit = my_chemistry.density_units / mass_hydrogen_cgs
+    thin_ci_flux = K_UVB_CI * fc["CI_density"][0] * number_unit / 12.0
+    thin_oi_flux = K_UVB_OI * fc["OI_density"][0] * number_unit / 16.0
+    assert np.isclose(
+        fluxes["kphCI_bg"][0], thin_ci_flux,
+        rtol=FLUX_RTOL, atol=0.0,
+    )
+    assert fluxes["kphOI_bg"][0] < 0.5 * thin_oi_flux

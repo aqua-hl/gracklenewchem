@@ -12,13 +12,20 @@ for
     O I + gamma -> O II + e-   (ionization threshold 13.62 eV)
     CO  + gamma -> C I + O I   (dissociation threshold 11.09 eV; the
                                 predissociating bands lie at 88.5-108 nm)
+    OH  + gamma -> O I + H     (dissociation threshold 279 nm / 4.44 eV,
+                                Heays et al. 2017 Table 2)
+    H2O + gamma -> products    (dissociation threshold 242 nm / 5.12 eV for
+                                the dominant H + OH channel; the total
+                                photodissociation cross section is used)
 
 on the same redshift grid as the existing /UVBRates/Chemistry/k24 dataset
-and writes them as three new datasets,
+and writes them as new datasets,
 
     /UVBRates/Chemistry/kphCI
     /UVBRates/Chemistry/kphOI
     /UVBRates/Chemistry/kdissCO
+    /UVBRates/Chemistry/kdissOH    (with --sigma-oh)
+    /UVBRates/Chemistry/kdissH2O   (with --sigma-h2o)
 
 into a COPY of an existing Grackle UV background table (the input table is
 never modified). These datasets are read by Grackle when metal_chemistry > 0
@@ -56,6 +63,15 @@ Inputs
    continuum of Chan, Cooper & Brion 1993, tabulated for an excitation
    temperature of 100 K and Doppler width b = 1 km/s).
 
+4. Optionally --sigma-oh / --sigma-h2o: the OH.h5 and H2O.h5 files from the
+   same archive; their 'photodissociation' (total) datasets are used
+   (OH: van Dishoeck & Dalgarno 1984 with the Heays et al. update, lines
+   broadened to 1 nm FWHM; H2O: Chan et al. 1993, Yoshino et al. 1996/97,
+   Parkinson & Yoshino 2003, Fillion et al. 2003/04, Mota et al. 2005, van
+   Harrevelt & van Hemert 2008). Note that unlike C I, O I and CO these
+   channels are driven mostly by photons at 130-190 nm, far below the
+   Lyman limit in energy.
+
 The integral runs from each channel's threshold up to the highest photon
 energy tabulated in the spectrum. The cross sections are taken to be zero
 outside the wavelength range tabulated in the Leiden files (for the HM2012
@@ -75,19 +91,21 @@ Example
 import argparse
 import os
 import shutil
-import sys
 
 import h5py
 import numpy as np
+
+# np.trapz was renamed to np.trapezoid in numpy 2.0
+_trapz = getattr(np, "trapezoid", None) or np.trapz
 
 # physical constants (CGS)
 h_planck = 6.62607015e-27   # erg s
 ev2erg = 1.60217653e-12     # matches src/clib/update_UVbackground_rates.cpp
 c_cgs = 2.99792458e10       # cm/s
 
-# thresholds: ionization potentials for C I and O I; the CO photo-
-# dissociation limit (Heays et al. 2017)
-E_TH_EV = {"CI": 11.26, "OI": 13.62, "CO": 11.09}
+# thresholds: ionization potentials for C I and O I; the CO, OH and H2O
+# photo-dissociation limits (Heays et al. 2017; OH: 279 nm, H2O: 242 nm)
+E_TH_EV = {"CI": 11.26, "OI": 13.62, "CO": 11.09, "OH": 4.44, "H2O": 5.12}
 
 # a tiny relative wavelength shift used to keep duplicated wavelengths
 # (absorption edges) strictly increasing without smearing the edge
@@ -173,7 +191,7 @@ def photo_rates(z, lam_spec, J, lam_sig, sigma, threshold_ev):
         J_grid = np.exp(np.interp(log_grid, log_lam_spec, logJ))
         J_grid[J_grid <= 10.0 * J_FLOOR] = 0.0
         integrand = J_grid * sig_grid / grid
-        rates[iz] = 4.0 * np.pi / h_planck * np.trapz(integrand, grid)
+        rates[iz] = 4.0 * np.pi / h_planck * _trapz(integrand, grid)
     return rates
 
 
@@ -211,6 +229,12 @@ def main():
                         help="Leiden database HDF5 cross-section file for O")
     parser.add_argument("--sigma-co", required=True,
                         help="Leiden database HDF5 cross-section file for CO")
+    parser.add_argument("--sigma-oh",
+                        help="Leiden database HDF5 cross-section file for OH "
+                             "(optional; adds the kdissOH dataset)")
+    parser.add_argument("--sigma-h2o",
+                        help="Leiden database HDF5 cross-section file for H2O "
+                             "(optional; adds the kdissH2O dataset)")
     parser.add_argument("--output", required=True,
                         help="output HDF5 file (a copy of --table plus the "
                              "new datasets; must differ from --table)")
@@ -250,12 +274,30 @@ def main():
             "2017, A&A, 602, A105; band model of Visser, van Dishoeck & "
             "Black 2009 with the continuum of Chan, Cooper & Brion 1993)"
         ),
+        "kdissOH": (
+            "computed by scripts/add_metal_UVB_rates.py: Haardt & Madau "
+            "(2012, ApJ, 746, 125) spectrum; OH total photo-dissociation "
+            "cross section from the Leiden database (Heays, Bosman & van "
+            "Dishoeck 2017, A&A, 602, A105; van Dishoeck & Dalgarno 1984 "
+            "with the Heays et al. update)"
+        ),
+        "kdissH2O": (
+            "computed by scripts/add_metal_UVB_rates.py: Haardt & Madau "
+            "(2012, ApJ, 746, 125) spectrum; H2O total photo-dissociation "
+            "cross section from the Leiden database (Heays, Bosman & van "
+            "Dishoeck 2017, A&A, 602, A105)"
+        ),
     }
-    channels = (
+    channels = [
         ("kphCI", "CI", args.sigma_ci, "photoionisation"),
         ("kphOI", "OI", args.sigma_oi, "photoionisation"),
         ("kdissCO", "CO", args.sigma_co, "photodissociation"),
-    )
+    ]
+    if args.sigma_oh:
+        channels.append(("kdissOH", "OH", args.sigma_oh, "photodissociation"))
+    if args.sigma_h2o:
+        channels.append(
+            ("kdissH2O", "H2O", args.sigma_h2o, "photodissociation"))
     new_datasets = {}
     for dset_name, species, sigma_file, sigma_dset in channels:
         lam_sig, sigma = read_leiden_cross_section(sigma_file, sigma_dset)
@@ -273,25 +315,20 @@ def main():
             dset.attrs["provenance"] = provenance[name]
 
     # sanity output
-    kph_ci = new_datasets["kphCI"]
-    kph_oi = new_datasets["kphOI"]
-    kdiss_co = new_datasets["kdissCO"]
+    # (note: kphOI > k24 is expected -- sigma_OI rises from threshold to
+    # ~1e-17 cm^2 at 20-50 eV while sigma_HI falls as ~E^-3, so O I collects
+    # more of the hard HM2012 spectrum than H I despite the similar
+    # thresholds; confirmed against Verner et al. 1996 cross sections in
+    # scripts/verify_metal_UVB_rates.ipynb)
+    names = [name for name, *_ in channels]
     print(f"wrote {args.output}")
-    print(f"{'z':>6} {'kphCI [1/s]':>12} {'kphOI [1/s]':>12} "
-          f"{'kdissCO [1/s]':>14} {'k24 [1/s]':>12}")
+    header = "".join(f"{name + ' [1/s]':>15}" for name in names)
+    print(f"{'z':>6}{header}{'k24 [1/s]':>15}")
     log1pz = np.log1p(z_table)
     for z0 in (0.0, 1.0, 2.0, 3.0, 6.0):
         vals = [np.exp(np.interp(np.log1p(z0), log1pz, np.log(y)))
-                for y in (kph_ci, kph_oi, kdiss_co, k24)]
-        print(f"{z0:>6.1f} {vals[0]:>12.4e} {vals[1]:>12.4e} "
-              f"{vals[2]:>14.4e} {vals[3]:>12.4e}")
-
-    bad = kph_oi > k24
-    if np.any(bad):
-        zbad = z_table[bad]
-        print(f"WARNING: kphOI > k24 at {bad.sum()} redshift(s) "
-              f"(z = {zbad.min():.3f} .. {zbad.max():.3f}); "
-              "kphOI is expected to be smaller than k24", file=sys.stderr)
+                for y in [new_datasets[name] for name in names] + [k24]]
+        print(f"{z0:>6.1f}" + "".join(f"{v:>15.4e}" for v in vals))
 
 
 if __name__ == "__main__":

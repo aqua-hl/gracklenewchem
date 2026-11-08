@@ -50,6 +50,11 @@ ENTRY(metal_cooling, INT, FALSE)
    0) off, 1) on */
 ENTRY(metal_chemistry, INT, FALSE)
 
+/* certified skeletal-reduction level for the explicit metal network:
+   0) full  1) eps=1e-3  2) eps=1e-2 (drops Si chain)  3) eps=1e-1 (+CO2)
+   (see grackle_chemistry_data.h for the certification domain) */
+ENTRY(metal_network_reduction, INT, 0)
+
 /* minimum temperature to include tabulated metal cooling.
    This is used to supplement the non-equilibrium metal cooling
    from setting metal_chemistry=1, which is only valid up to T~1e4 K.

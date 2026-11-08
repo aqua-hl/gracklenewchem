@@ -23,6 +23,16 @@ from .grackle_wrapper import (
     chemistry_data as chemistry_data
 )
 
+from .metal_reaction_diagnostics import (
+    METAL_REACTION_FLUX_FIELDS as METAL_REACTION_FLUX_FIELDS,
+    METAL_REACTION_LABELS as METAL_REACTION_LABELS,
+    METAL_REACTION_OUTPUT_FIELDS as METAL_REACTION_OUTPUT_FIELDS,
+    METAL_REACTION_RATE_SOURCES as METAL_REACTION_RATE_SOURCES,
+    METAL_REACTION_SPECIES as METAL_REACTION_SPECIES,
+    METAL_REACTION_STOICHIOMETRY as METAL_REACTION_STOICHIOMETRY,
+    metal_reaction_catalog as metal_reaction_catalog,
+)
+
 from .utilities.convenience import (
     setup_fluid_container as setup_fluid_container
 )

@@ -381,6 +381,52 @@ int init_kcol_rate_tables(
   opaque_storage->kcol_rate_tables = tables;
   opaque_storage->used_kcol_rate_indices = used_kcol_rate_indices;
   opaque_storage->n_kcol_rate_indices = (int)n_kcol_rate_indices;
+
+  // Apply the certified metal-network skeletal reduction (see
+  // metal_network_reduction in grackle_chemistry_data.h). Removed reactions
+  // are zeroed, so every term that still references them vanishes exactly,
+  // and dropped from the interpolation list, so they cost nothing per cell.
+  // Removed species' update equations are skipped in the solver.
+  if (my_chemistry->metal_chemistry > 0 &&
+      my_chemistry->metal_network_reduction > 0) {
+    int reduced[16];
+    int n_reduced = 0;
+    if (my_chemistry->metal_network_reduction >= 1) {
+      reduced[n_reduced++] = CollisionalRxnLUT::kz23;
+      reduced[n_reduced++] = CollisionalRxnLUT::kz31;
+    }
+    if (my_chemistry->metal_network_reduction >= 2) {
+      reduced[n_reduced++] = CollisionalRxnLUT::kz53;
+    }
+    if (my_chemistry->metal_network_reduction >= 3) {
+      reduced[n_reduced++] = CollisionalRxnLUT::kz52;
+      reduced[n_reduced++] = CollisionalRxnLUT::kz54;
+    }
+    if (my_chemistry->metal_network_reduction >= 4) {
+      reduced[n_reduced++] = CollisionalRxnLUT::kz32;
+    }
+    for (int k = 0; k < n_reduced; k++) {
+      double* table = tables->data[reduced[k]];
+      for (int b = 0; b < my_chemistry->NumberOfTemperatureBins; b++) {
+        table[b] = 0.0;
+      }
+    }
+    int kept = 0;
+    for (int k = 0; k < (int)n_kcol_rate_indices; k++) {
+      int removed = 0;
+      for (int m = 0; m < n_reduced; m++) {
+        if (used_kcol_rate_indices[k] == reduced[m]) {
+          removed = 1;
+          break;
+        }
+      }
+      if (!removed) {
+        used_kcol_rate_indices[kept++] = used_kcol_rate_indices[k];
+      }
+    }
+    opaque_storage->n_kcol_rate_indices = kept;
+  }
+
   return GR_SUCCESS;
 }
 

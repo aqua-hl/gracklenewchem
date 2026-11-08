@@ -14,6 +14,7 @@
 OBJS_CONFIG_LIB = \
         $(AUTOGEN_DIR)/auto_general.lo \
         api/calculate_cooling_rate_contributions.lo \
+        api/calculate_metal_reaction_fluxes.lo \
         api/calculate_cooling_time.lo \
         api/calculate_dust_temperature.lo \
         api/calculate_T_related.lo \

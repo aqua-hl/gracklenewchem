@@ -958,19 +958,15 @@ inline void species_density_updates_gauss_seidel(
             ( 1. + acoef*dtit[i] );
 
 
-        // ***** CO2I ********* (frozen at metal_network_reduction >= 3)
-        if (my_chemistry->metal_network_reduction < 3) {
-          scoef = 0. + 44. * ( 0.
-              + kcol_buf[CollisionalRxnLUT::kz26][i] *    OHI[i] *    COI[i] / 476.
-             );
-          acoef = 0.;
+        // ***** CO2I *********
+        scoef = 0. + 44. * ( 0.
+            + kcol_buf[CollisionalRxnLUT::kz26][i] *    OHI[i] *    COI[i] / 476.
+           );
+        acoef = 0.;
 
-          out_spdens(spid.metal(MetalSpLUT::CO2I), i) =
-              ( scoef*dtit[i] + CO2I[i] ) /
-              ( 1. + acoef*dtit[i] );
-        } else {
-          out_spdens(spid.metal(MetalSpLUT::CO2I), i) = CO2I[i];
-        }
+        out_spdens(spid.metal(MetalSpLUT::CO2I), i) =
+            ( scoef*dtit[i] + CO2I[i] ) /
+            ( 1. + acoef*dtit[i] );
 
 
         // ***** OI **********
@@ -1083,8 +1079,8 @@ inline void species_density_updates_gauss_seidel(
             ( 1. + acoef*dtit[i] );
 
 
-        // ***** SiI ********** (frozen at metal_network_reduction >= 2)
-        if (my_chemistry->metal_network_reduction < 2) {
+        // ***** SiI ********** (frozen at metal_network_reduction >= 3)
+        if (my_chemistry->metal_network_reduction < 3) {
           scoef = 0. + 28. * ( 0.
              );
           acoef = 0.
@@ -1105,8 +1101,8 @@ inline void species_density_updates_gauss_seidel(
         }
 
 
-        // ***** SiOI ********** (frozen at metal_network_reduction >= 2)
-        if (my_chemistry->metal_network_reduction < 2) {
+        // ***** SiOI ********** (frozen at metal_network_reduction >= 3)
+        if (my_chemistry->metal_network_reduction < 3) {
           scoef = 0. + 44. * ( 0.
               + kcol_buf[CollisionalRxnLUT::kz52][i] *   SiI[i] *    OHI[i] / 476.
               + kcol_buf[CollisionalRxnLUT::kz53][i] *   SiI[i] *    O2I[i] / 896.
@@ -1132,8 +1128,8 @@ inline void species_density_updates_gauss_seidel(
         }
 
 
-        // ***** SiO2I ********** (frozen at metal_network_reduction >= 2)
-        if (my_chemistry->metal_network_reduction < 2) {
+        // ***** SiO2I ********** (frozen at metal_network_reduction >= 3)
+        if (my_chemistry->metal_network_reduction < 3) {
           scoef = 0. + 60. * ( 0.
               + kcol_buf[CollisionalRxnLUT::kz54][i] *  SiOI[i] *    OHI[i] / 748.
              );
@@ -2326,17 +2322,15 @@ inline void species_density_derivatives_0d(
 
 
 
-      // ***** CO2I ********* (frozen at metal_network_reduction >= 3)
-      if (my_chemistry->metal_network_reduction < 3) {
-        scoef = 0. + 44. * ( 0.
-            + kcol_buf[CollisionalRxnLUT::kz26][0]    *   OHI        *   COI        / 476.
-           );
-        acoef = 0.;
+      // ***** CO2I *********
+      scoef = 0. + 44. * ( 0.
+          + kcol_buf[CollisionalRxnLUT::kz26][0]    *   OHI        *   COI        / 476.
+         );
+      acoef = 0.;
 
-        deriv(spid.metal(MetalSpLUT::CO2I), 0) =
-            deriv(spid.metal(MetalSpLUT::CO2I), 0) +
-            (scoef - acoef * CO2I);
-      }
+      deriv(spid.metal(MetalSpLUT::CO2I), 0) =
+          deriv(spid.metal(MetalSpLUT::CO2I), 0) +
+          (scoef - acoef * CO2I);
 
 
 
@@ -2454,8 +2448,8 @@ inline void species_density_derivatives_0d(
 
 
 
-      // ***** SiI ********** (frozen at metal_network_reduction >= 2)
-      if (my_chemistry->metal_network_reduction < 2) {
+      // ***** SiI ********** (frozen at metal_network_reduction >= 3)
+      if (my_chemistry->metal_network_reduction < 3) {
         scoef = 0. + 28. * ( 0.
            );
         acoef = 0.
@@ -2475,8 +2469,8 @@ inline void species_density_derivatives_0d(
 
 
 
-      // ***** SiOI ********** (frozen at metal_network_reduction >= 2)
-      if (my_chemistry->metal_network_reduction < 2) {
+      // ***** SiOI ********** (frozen at metal_network_reduction >= 3)
+      if (my_chemistry->metal_network_reduction < 3) {
         scoef = 0. + 44. * ( 0.
             + kcol_buf[CollisionalRxnLUT::kz52][0]    *   SiI        *   OHI        / 476.
             + kcol_buf[CollisionalRxnLUT::kz53][0]    *   SiI        *   O2I        / 896.
@@ -2501,8 +2495,8 @@ inline void species_density_derivatives_0d(
 
 
 
-      // ***** SiO2I ********** (frozen at metal_network_reduction >= 2)
-      if (my_chemistry->metal_network_reduction < 2) {
+      // ***** SiO2I ********** (frozen at metal_network_reduction >= 3)
+      if (my_chemistry->metal_network_reduction < 3) {
         scoef = 0. + 60. * ( 0.
             + kcol_buf[CollisionalRxnLUT::kz54][0]    *  SiOI        *   OHI        / 748.
            );
