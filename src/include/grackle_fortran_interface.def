@@ -164,6 +164,7 @@ c     This is the fortran definition of grackle_chemistry_data
          INTEGER(C_INT) :: use_dust_density_field
          INTEGER(C_INT) :: dust_recombination_cooling
          INTEGER(C_INT) :: metal_chemistry
+         INTEGER(C_INT) :: metal_network_reduction
          REAL(C_DOUBLE) :: tabulated_cooling_minimum_temperature
          INTEGER(C_INT) :: grain_growth
          INTEGER(C_INT) :: multi_metals

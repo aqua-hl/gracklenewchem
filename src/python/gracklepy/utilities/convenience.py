@@ -20,14 +20,25 @@ from gracklepy.fluid_container import \
     FluidContainer
 
 from gracklepy.utilities.atomic import \
-    atomic_mass, \
-    atomic_number, \
-    mass_number, \
     primordial_elements, \
     solar_abundance
 from gracklepy.utilities.physical_constants import \
     mass_hydrogen_cgs, \
     sec_per_Myr
+
+# Natural-isotope masses preserve the custom dust model normalization.
+_DUST_ATOMIC_MASSES = {
+    "H" : 1.00794,   "He": 4.002602,  "Li": 6.941,
+    "Be": 9.012182,  "B" : 10.811,    "C" : 12.0107,
+    "N" : 14.0067,   "O" : 15.9994,   "F" : 18.9984032,
+    "Ne": 20.1797,   "Na": 22.989770, "Mg": 24.3050,
+    "Al": 26.981538, "Si": 28.0855,   "P" : 30.973761,
+    "S" : 32.065,    "Cl": 35.453,    "Ar": 39.948,
+    "K" : 39.0983,   "Ca": 40.078,    "Sc": 44.955910,
+    "Ti": 47.867,    "V" : 50.9415,   "Cr": 51.9961,
+    "Mn": 54.938049, "Fe": 55.845,    "Co": 58.933200,
+    "Ni": 58.6934,   "Cu": 63.546,    "Zn": 65.409,
+    "D" : 2.0141017778}
 
 _DUST_SPECIES_ELEMENT_FIELDS = {
     "C":  "metal_density_carbon",
@@ -62,8 +73,8 @@ def solar_metal_mass_fractions(elements=("C", "O", "Mg", "Si", "Fe")):
     of solar metal mass).
     """
     metals = [el for el in solar_abundance if el not in ("H", "He")]
-    total = sum(solar_abundance[el] * atomic_mass[el] for el in metals)
-    return {el: solar_abundance[el] * atomic_mass[el] / total for el in elements}
+    total = sum(solar_abundance[el] * _DUST_ATOMIC_MASSES[el] for el in metals)
+    return {el: solar_abundance[el] * _DUST_ATOMIC_MASSES[el] / total for el in elements}
 
 
 def seed_dust_species_dust(fc):
