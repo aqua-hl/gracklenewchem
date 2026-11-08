@@ -948,3 +948,117 @@ TEST(StiffNewtonRaphson, FloatRoundingRequiresACommonCoupledSolution) {
     EXPECT_NEAR(y[1], 1.005, 1.e-5);
   }
 }
+
+TEST(StiffNewtonRaphson, FailedResidualKeepsAContractingJacobian) {
+  // Stiff, mildly nonlinear relaxation: the start Jacobian stays a good
+  // approximation, so after the first failed residual check (the unscaled
+  // residual is ~h*D times the state error) further corrections with it
+  // contract quickly. They must reach the actual root without a rebuild.
+  constexpr double D = 1.e6, h = 1., initial = 1.01;
+  int jacobian_calls = 0;
+  const auto calc_f = [&](const double* y, double* f) {
+    const double x = y[0] - 1.;
+    f[0] = -D * x * (1. + x);
+  };
+  const auto rhs = [&](const double* y, double* f,
+                       GRIMPL_NS::View<double**> jac) {
+    ++jacobian_calls;
+    calc_f(y, f);
+    jac(0, 0) = -D * (1. + 2. * (y[0] - 1.));
+  };
+  double y = initial, f0, jac_buf, f_end = -1.;
+  GRIMPL_NS::View<double**> jac(&jac_buf, 1, 1);
+  rhs(&y, &f0, jac);
+  jacobian_calls = 0;
+  GRIMPL_NS::integrate::StiffNewtonRaphson solver(1, 1.e-6, 20);
+  std::vector<double> scratch(solver.num_scratch_buf_elements());
+  const double atol = 1.e-17;
+  const auto result = solver.step_modified(
+    &y, h, calc_f, rhs, 1, scratch.data(), &atol, &jac, &f0, true, &f_end);
+  ASSERT_TRUE(result.converged());
+  EXPECT_EQ(jacobian_calls, 0);
+  // x = y - 1 solves D x^2 + (D + 1) x - (initial - 1) = 0.
+  const double c = initial - 1.;
+  const double root =
+    1. + 2. * c / ((D + 1.) + std::sqrt((D + 1.) * (D + 1.) + 4. * D * c));
+  double f_actual;
+  calc_f(&y, &f_actual);
+  EXPECT_LE(std::fabs(y - initial - h * f_actual), 1.e-6 * initial);
+  EXPECT_NEAR(y, root, 1.e-12);
+  // f_out is f at the returned state
+  EXPECT_EQ(f_end, f_actual);
+}
+
+namespace {
+// Start state p = (1, 1), h = 1, R(y) = y - p - f(y), u = y - p, s = u0 + u1.
+// Below the diagonal kink s = d the residual is stiff and affine,
+// R = sigma*(u - ustar), and its root ustar lies past the kink. Past the kink
+// a steep term folds R away from zero, so the backward-Euler equations have
+// no root at all. Probes of each coordinate separately over a state-tolerance
+// box (|u_j| <= 1e-6 < d) stay below the kink and see only the affine part.
+struct DiagonalFold {
+  bool smooth;
+  static constexpr double sigma = 1.e3, K = 1.e6, d = 1.2e-6, ustar = .8e-6;
+  static constexpr double width = 1.e-8;
+  void fold(double s, double& v, double& dv) const {
+    if (!smooth) {
+      v = std::max(s - d, 0.);
+      dv = s > d ? 1. : 0.;
+      return;
+    }
+    const double z = (s - d) / width;
+    v = width * (z > 30. ? z : std::log1p(std::exp(z)));
+    dv = z >= 0. ? 1. / (1. + std::exp(-z)) : std::exp(z) / (1. + std::exp(z));
+  }
+  void residual(const double* y, double* r) const {
+    const double u0 = y[0] - 1., u1 = y[1] - 1.;
+    double v, dv;
+    fold(u0 + u1, v, dv);
+    r[0] = sigma * (u0 - ustar) - K * v;
+    r[1] = sigma * (u1 - ustar) - K * v;
+  }
+  void operator()(const double* y, double* f,
+                  GRIMPL_NS::View<double**> jac) const {
+    double r[2], v, dv;
+    residual(y, r);
+    fold(y[0] - 1. + y[1] - 1., v, dv);
+    for (int i = 0; i < 2; ++i) {
+      f[i] = (y[i] - 1.) - r[i];
+      for (int j = 0; j < 2; ++j) {
+        jac(i, j) = ((i == j) ? 1. - sigma : 0.) + K * dv;
+      }
+    }
+  }
+};
+}  // namespace
+
+TEST(StiffNewtonRaphson, RoundingFallbackDoesNotAcceptAModelOnlyRoot) {
+  // A reused very stiff Jacobian makes the first corrections tiny, so the
+  // solver reaches its rounding fallback at p with a fresh affine Jacobian.
+  // A coupled secant model from coordinate probes then predicts a root within
+  // the state tolerance, but the actual equations have none: accepting p
+  // (residual ~8e-4) would be false convergence. Failure is safe.
+  for (bool smooth : {false, true}) {
+    DiagonalFold rhs{smooth};
+    const auto calc_f = [&](const double* y, double* f) {
+      double unused[4];
+      rhs(y, f, GRIMPL_NS::View<double**>(unused, 2, 2));
+    };
+    double y[] = {1., 1.}, f0[2], stale_buf[4] = {1. - 1.e9, 0., 0., 1. - 1.e9};
+    calc_f(y, f0);
+    GRIMPL_NS::View<double**> stale(stale_buf, 2, 2);
+    GRIMPL_NS::integrate::StiffNewtonRaphson solver(
+      2, 1.e-6, 20, std::numeric_limits<double>::epsilon(),
+      std::numeric_limits<double>::denorm_min());
+    std::vector<double> scratch(solver.num_scratch_buf_elements());
+    const double atol[] = {1.e-17, 1.e-17};
+    const auto result = solver.step_modified(
+      y, 1., calc_f, rhs, 2, scratch.data(), atol, &stale, f0, false);
+    if (result.converged()) {
+      double r[2];
+      rhs.residual(y, r);
+      EXPECT_LE(std::fabs(r[0]), 2.e-6) << "smooth=" << smooth;
+      EXPECT_LE(std::fabs(r[1]), 2.e-6) << "smooth=" << smooth;
+    }
+  }
+}

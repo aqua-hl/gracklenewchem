@@ -42,12 +42,15 @@ struct AdaptiveIntegrateResult {
 /// large backward-Euler steps from spuriously damping that growing mode.
 /// It does not assert stability of every eigenmode of a coupled network.
 ///
-/// Cost: the Jacobian at the start of a substep is reused by the backward-Euler
-/// solves (modified Newton). It is rebuilt when the iteration contracts slowly
-/// or endpoint residual validation fails. Before convergence is accepted,
-/// the RHS is always checked at the returned state. The first half step's
-/// actual endpoint Jacobian starts the second half. At the final endpoint only
-/// the thermal diagonal is needed, so the guard evaluates it directly.
+/// Cost: the Jacobian at the start of a substep is reused by all three
+/// backward-Euler solves (modified Newton), including the second half step.
+/// It is rebuilt when the iteration contracts slowly or the endpoint residual
+/// stops shrinking. Convergence is accepted only on the residual at the
+/// returned state (or, for a rounded RHS, on a rounding-limited root checked
+/// after a rebuild), so a stale Jacobian costs iterations, not correctness.
+/// The RHS at the returned state is passed on, so the second half and the
+/// guard do not re-evaluate it. The guard needs only the thermal diagonal at the midpoint and the
+/// endpoint, so it probes that directly.
 class AdaptiveBackwardEuler {
   int max_variables_;
   double relative_tolerance_;
@@ -94,8 +97,8 @@ public:
                 rhs_relative_roundoff, rhs_absolute_roundoff) {}
 
   int num_scratch_buf_elements() const noexcept {
-    // Nine vectors and two matrices, plus the Newton solver's scratch space.
-    return 9 * max_variables_ + 2 * max_variables_ * max_variables_
+    // Ten vectors and one matrix, plus the Newton solver's scratch space.
+    return 10 * max_variables_ + max_variables_ * max_variables_
       + newton_.num_scratch_buf_elements();
   }
 
@@ -149,10 +152,10 @@ public:
     double* f_initial = newton_atol + n;
     double* probe = f_initial + n;
     double* f_probe = probe + n;
-    View<double**> jac(f_probe + n, n, n);
-    // Jacobian validated at the actual end of the first half step
-    View<double**> jac_mid(jac.data() + n * n, n, n);
-    double* newton_scratch = jac_mid.data() + n * n;
+    // f at the returned midpoint (f at the returned endpoint goes into `f`)
+    double* f_middle = f_probe + n;
+    View<double**> jac(f_middle + n, n, n);
+    double* newton_scratch = jac.data() + n * n;
 
     for (int i = 0; i < n; ++i) {
       if (!std::isfinite(absolute_tolerance[i]) || absolute_tolerance[i] < 0.) {
@@ -202,64 +205,52 @@ public:
       std::copy(initial, initial + n, full);
       std::copy(initial, initial + n, fine);
       // The full step and the first half start at `initial`, where `jac` was
-      // evaluated. The second half starts at the midpoint with a Jacobian
-      // evaluated at the returned midpoint (after its final correction).
-      bool mid_ok = false;
+      // evaluated. The second half starts at the midpoint and reuses `jac`
+      // as well; Newton rebuilds it there only if the iteration needs it.
+      // Newton returns f at the midpoint and at the endpoint, so neither the
+      // second half nor the guard re-evaluates them.
       auto run_newton = [&](double* state, double step_dt,
-                            const View<double**>* jacobian,
                             const double* f_start, bool jacobian_at_start,
-                            View<double**>* jacobian_out, bool* exported) {
+                            double* f_end) {
         IntegrateResult nr = newton_.step_modified(
           state, step_dt, calc_f, calc_f_and_jacobian, n, newton_scratch,
-          newton_atol, jacobian, f_start, jacobian_at_start, jacobian_out,
-          exported);
+          newton_atol, &jac, f_start, jacobian_at_start, f_end);
         result.newton_iterations += nr.iterations;
         return nr.converged() && valid_state_(state, n, energy_index);
       };
 
-      if (!run_newton(full, h, &jac, f_initial, true, nullptr, nullptr) ||
-          !run_newton(fine, 0.5 * h, &jac, f_initial, true, &jac_mid,
-                      &mid_ok)) {
+      if (!run_newton(full, h, f_initial, true, nullptr) ||
+          !run_newton(fine, 0.5 * h, f_initial, true, f_middle)) {
         h *= 0.5;
         continue;
       }
       std::copy(fine, fine + n, middle);
-      // No subsequent solve reuses the final endpoint's full Jacobian.
-      // Evaluate its thermal diagonal explicitly below instead.
-      if (!run_newton(fine, 0.5 * h, mid_ok ? &jac_mid : &jac, nullptr,
-                      mid_ok, nullptr, nullptr)) {
+      if (!run_newton(fine, 0.5 * h, f_middle, false, f)) {
         h *= 0.5;
         continue;
       }
 
       // Check the entire candidate path, not only the initial derivative.
-      // Only J_ee is needed: exported matrices are evaluated at the returned
-      // states, and Newton has checked their RHS values for finiteness. If no
-      // matrix was exported, evaluate the candidate and probe its slope here.
+      // Only J_ee is needed: one perturbed RHS evaluation per returned state,
+      // whose f Newton has already evaluated and checked for finiteness.
       double max_positive_j = std::max(0., initial_thermal_j);
       bool finite_candidate = true;
       if (energy_index >= 0) {
         for (int c = 0; c < 2; ++c) {
           const double* candidate = (c == 0) ? middle : fine;
-          if (c == 0 && mid_ok) {
-            const double jee = jac_mid(energy_index, energy_index);
-            finite_candidate = finite_candidate && std::isfinite(jee);
-            if (finite_candidate) {
-              max_positive_j = std::max(max_positive_j, jee);
-            }
-            continue;
-          }
-          calc_f(candidate, f);
+          const double* f_candidate = (c == 0) ? f_middle : f;
           std::copy(candidate, candidate + n, probe);
           const double de = jacobian_step_ *
             std::max(std::fabs(candidate[energy_index]),
                      std::numeric_limits<double>::min());
           probe[energy_index] += de;
           calc_f(probe, f_probe);
-          const double jee = (f_probe[energy_index] - f[energy_index]) / de;
+          const double jee =
+            (f_probe[energy_index] - f_candidate[energy_index]) / de;
           bool ok = std::isfinite(jee);
           for (int i = 0; i < n; ++i) {
-            ok = ok && std::isfinite(f[i]) && std::isfinite(f_probe[i]);
+            ok = ok && std::isfinite(f_candidate[i]) &&
+              std::isfinite(f_probe[i]);
           }
           finite_candidate = finite_candidate && ok;
           if (finite_candidate) {
