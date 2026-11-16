@@ -24,8 +24,40 @@
 #include "lnT_prep.hpp"
 #include "math/misc.hpp"
 #include "opaque_storage.hpp"
+#include "../support/scratch.hpp"
 
 namespace GRIMPL_NAMESPACE_DECL {
+
+namespace {
+
+/// Per-thread grain scratch for calc_Tdust_and_chem_contrib, kept between
+/// calls. One slot serves single-cell (0-D) calls, the other row calls, so
+/// the two do not evict each other. Sizes match what the routine asked for.
+struct TdustScratch {
+  int nelem = 0, table_len = 0;
+  InternalDustPropBuf prop{};
+  GrainSpeciesCollection kappa{}, heatrate{};
+
+  void ensure(int n, int tab) {
+    if (n == nelem && tab == table_len) return;
+    release();
+    prop = new_InternalDustPropBuf(n, tab);
+    kappa = new_GrainSpeciesCollection(n);
+    heatrate = new_GrainSpeciesCollection(n);
+    nelem = n;
+    table_len = tab;
+  }
+  void release() {
+    if (nelem == 0) return;
+    drop_InternalDustPropBuf(&prop);
+    drop_GrainSpeciesCollection(&kappa);
+    drop_GrainSpeciesCollection(&heatrate);
+    nelem = table_len = 0;
+  }
+  ~TdustScratch() { release(); }
+};
+
+}  // namespace
 
 // Some ideas for refactoring
 // - we probably want to break the following function up into its constituent
@@ -337,26 +369,27 @@ void DustSolver::calc_Tdust_and_chem_contrib(
 
   // buffers of intermediate quantities used within dust-routines (for
   // calculating quantites related to heating/cooling)
-  InternalDustPropBuf internal_dust_prop_buf = new_InternalDustPropBuf(
-      my_fields->grid_dimension[0],
-      GrainMetalInjectPathways_get_n_log10Tdust_vals(
-          my_rates->opaque_storage->inject_pathway_props));
+  // reused per-thread scratch: slot 0 for single-cell calls, slot 1 for rows
+  static thread_local TdustScratch tdust_scratch[2];
+  TdustScratch& scratch = tdust_scratch[my_fields->grid_dimension[0] > 1];
+  scratch.ensure(my_fields->grid_dimension[0],
+                 GrainMetalInjectPathways_get_n_log10Tdust_vals(
+                     my_rates->opaque_storage->inject_pathway_props));
+  InternalDustPropBuf internal_dust_prop_buf = scratch.prop;
 
   // opacity coefficients for each dust grain (the product of opacity
   // coefficient & gas mass density is the linear absortpion coefficient)
-  GrainSpeciesCollection grain_kappa =
-      new_GrainSpeciesCollection(my_fields->grid_dimension[0]);
+  GrainSpeciesCollection grain_kappa = scratch.kappa;
   // closely related to grain_kappa
-  std::vector<double> kappa_tot(my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, kappa_tot, my_fields->grid_dimension[0]);
 
   // holds the gas/grain-species heat transfer rates
-  GrainSpeciesCollection gas_grainsp_heatrate =
-      new_GrainSpeciesCollection(my_fields->grid_dimension[0]);
+  GrainSpeciesCollection gas_grainsp_heatrate = scratch.heatrate;
   // closely related to gas_grainsp_heatrate
-  std::vector<double> gasgr(my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, gasgr, my_fields->grid_dimension[0]);
 
   // holds values of the interstellar radiation field
-  std::vector<double> myisrf(my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, myisrf, my_fields->grid_dimension[0]);
 
   // 1d array of Hydrogen number densities
   // TODO: get rid of this buffer
@@ -364,7 +397,7 @@ void DustSolver::calc_Tdust_and_chem_contrib(
   //    small impact on rruntime
   // -> Getting rid of the buffer reduces cache complexity and simplifies logic
   //    (in fact, its plausible that getting rid of this could speed things up)
-  std::vector<double> nH(my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, nH, my_fields->grid_dimension[0]);
   for (int i = idx_range.i_start; i < idx_range.i_stop; i++) {
     if (itmask[i] != MASK_FALSE) {
       nH[i] = rhoH[i] * dom;
@@ -372,7 +405,7 @@ void DustSolver::calc_Tdust_and_chem_contrib(
   }
 
   // a scratch buffer (with some refactoring, this can probably be removed)
-  std::vector<double> gasgr_tdust(my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, gasgr_tdust, my_fields->grid_dimension[0]);
 
   // compute various dust properties
   dust_related_props(anydust, tgas, nH.data(), metallicity, itmask,
@@ -449,10 +482,7 @@ void DustSolver::calc_Tdust_and_chem_contrib(
                             *rxn_rate_buf, internal_dust_prop_buf);
   }
 
-  // Free memory
-  drop_InternalDustPropBuf(&internal_dust_prop_buf);
-  drop_GrainSpeciesCollection(&grain_kappa);
-  drop_GrainSpeciesCollection(&gas_grainsp_heatrate);
+  // the grain scratch stays in tdust_scratch for the next call
 }
 
 }  // namespace GRIMPL_NAMESPACE_DECL

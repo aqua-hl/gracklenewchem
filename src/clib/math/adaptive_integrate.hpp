@@ -26,6 +26,10 @@ struct AdaptiveIntegrateResult {
   int retries;
   int newton_iterations;
   double error_norm;
+  bool fast_accepted = false;  // the full step was accepted on its own
+  // cheap error estimate of the accepted trial's full step (-1 if not made)
+  double fast_estimate = -1.;
+  bool extrapolated = false;  // the accepted state is 2*fine - full
 
   bool converged() const noexcept { return flag == TerminateFlag::CONVERGED; }
 };
@@ -57,6 +61,11 @@ class AdaptiveBackwardEuler {
   double max_fractional_change_;
   int max_retries_;
   double jacobian_step_;  // relative energy perturbation for the J_ee guard
+  double fast_accept_ = 0.;  // 0 disables the shortcuts below
+  int fast_filters_ = 2;     // damping solves applied to the error estimate
+  bool fast_audit_ = false;  // estimate only; always do all three solves
+  bool fast_keep_halves_ = true;  // which of the two shortcuts to take
+  bool extrapolate_ = false;      // accept 2*fine - full instead of fine
   StiffNewtonRaphson newton_;
 
   static bool valid_state_(const double* y, int n, int energy_index) {
@@ -95,6 +104,22 @@ public:
         jacobian_step_(jacobian_step),
         newton_(max_variables, nonlinear_tolerance, 20,
                 rhs_relative_roundoff, rhs_absolute_roundoff) {}
+
+  /// Shortcut when a damped error estimate is at most `threshold` (tolerance
+  /// units, 0 = off). keep_halves: skip the full-step solve, same accepted
+  /// state. Otherwise accept the full step and skip the half steps.
+  void set_fast_accept(double threshold, int filters = 2, bool audit = false,
+                       bool keep_halves = true) noexcept {
+    fast_accept_ = threshold;
+    fast_filters_ = filters;
+    fast_audit_ = audit;
+    fast_keep_halves_ = keep_halves;
+  }
+
+  /// Accept 2*fine - full: second order, and linear invariants are kept
+  /// (weights sum to one). Falls back to the half steps if a component would
+  /// go negative. The error test stays the first-order one.
+  void set_extrapolate(bool on) noexcept { extrapolate_ = on; }
 
   int num_scratch_buf_elements() const noexcept {
     // Ten vectors and one matrix, plus the Newton solver's scratch space.
@@ -168,6 +193,21 @@ public:
     // The start-state f and Jacobian are reused by every solve below.
     calc_f_and_jacobian(initial, f_initial, jac);
     if (!finite_derivatives_(f_initial, jac, n)) { return result; }
+    // Factors of (I - h jac) for the two step sizes in use. Both half steps
+    // share one, and a retry at half the step reuses the previous half's.
+    SharedLU lu_cache[2];
+    int lu_last = 1;
+    const auto factors_for = [&](double step_dt) -> SharedLU* {
+      for (int c = 0; c < 2; ++c) {
+        if (lu_cache[c].valid && lu_cache[c].h == step_dt) {
+          lu_last = c;
+          return &lu_cache[c];
+        }
+      }
+      lu_last = 1 - lu_last;
+      lu_cache[lu_last].valid = false;
+      return &lu_cache[lu_last];
+    };
 
     double h = proposed_dt;
     const double initial_thermal_j =
@@ -179,6 +219,10 @@ public:
       return jac(i, i) < 0. && -jac(i, i) * step > 10.;
     };
 
+    // Set when the predictor below shortens the step: some component is then
+    // about to change by the full allowed fraction, so the step cannot be far
+    // below the error tolerance and the shortcuts are not worth testing.
+    bool change_limited = false;
     // A diagonal linearized backward-Euler predictor avoids repeatedly
     // halving a cosmological step just to resolve an initial transient.
     // Acceptance still uses the full coupled solutions below; this predictor
@@ -190,7 +234,10 @@ public:
       const double limit = max_fractional_change_ * scale;
       const double excess = std::fabs(f_initial[i])
         - limit * std::max(0., -jac(i, i));
-      if (excess > 0.) { h = std::min(h, limit / excess); }
+      if (excess > 0. && limit / excess < h) {
+        h = limit / excess;
+        change_limited = true;
+      }
     }
 
     // A strictly positive floor also avoids underflow of the two half steps.
@@ -214,13 +261,90 @@ public:
                             double* f_end) {
         IntegrateResult nr = newton_.step_modified(
           state, step_dt, calc_f, calc_f_and_jacobian, n, newton_scratch,
-          newton_atol, &jac, f_start, jacobian_at_start, f_end);
+          newton_atol, &jac, f_start, jacobian_at_start, f_end,
+          factors_for(step_dt));
         result.newton_iterations += nr.iterations;
         return nr.converged() && valid_state_(state, n, energy_index);
       };
 
-      if (!run_newton(full, h, f_initial, true, nullptr) ||
-          !run_newton(fine, 0.5 * h, f_initial, true, f_middle)) {
+      // Error of one backward-Euler solve a -> b: (step_dt/2)(f_b - f_a),
+      // damped twice by that solve's own (I - step_dt J). Triangular solves
+      // only; returned in units of the error tolerance.
+      const auto damped_error = [&](double step_dt, const double* a,
+                                    const double* f_a, const double* b,
+                                    const double* f_b) -> double {
+        SharedLU* lu = factors_for(step_dt);
+        if (!lu->valid) { return infinity; }
+        for (int i = 0; i < n; ++i) {
+          probe[i] = 0.5 * step_dt * (f_b[i] - f_a[i]) / lu->scale[i];
+        }
+        for (int pass = 0; pass < fast_filters_; ++pass) {
+          lu_solve(n, lu->lu, lu->piv, probe);
+        }
+        double worst = 0.;
+        for (int i = 0; i < n; ++i) {
+          const double scale = absolute_tolerance[i] + relative_tolerance_ *
+            std::max(std::fabs(a[i]), std::fabs(b[i]));
+          const double delta = std::fabs(probe[i] * lu->scale[i]);
+          worst = std::max(worst, (scale > 0.) ? delta / scale
+                                    : (delta == 0. ? 0. : infinity));
+        }
+        return std::isfinite(worst) ? worst : infinity;
+      };
+      const bool test_fast = fast_accept_ > 0. &&
+        (fast_audit_ || (retry == 0 && !change_limited));
+      const bool halves_first = test_fast && fast_keep_halves_;
+      const bool try_fast = test_fast && !fast_keep_halves_ &&
+        initial_thermal_j <= 0.;
+      if (!halves_first &&
+          !run_newton(full, h, f_initial, true, try_fast ? f : nullptr)) {
+        h *= 0.5;
+        continue;
+      }
+      double estimate = -1.;
+      if (try_fast) {
+        estimate = damped_error(h, initial, f_initial, full, f);
+        double change = 0.;
+        for (int i = 0; i < n; ++i) {
+          const double change_scale = max_fractional_change_
+            * std::max(std::fabs(initial[i]),
+                       absolute_tolerance[i] / relative_tolerance_);
+          const double change_delta = std::fabs(full[i] - initial[i]);
+          const double change_i = slaved(i, h) ? 0. :
+            (change_scale > 0.) ? change_delta / change_scale
+                                : (change_delta == 0. ? 0. : infinity);
+          change = std::max(change, change_i);
+        }
+        bool fast = estimate <= fast_accept_ && change <= 1. && !fast_audit_;
+        if (fast && energy_index >= 0) {
+          // Thermal guard at the endpoint. A growing mode takes the full path.
+          std::copy(full, full + n, probe);
+          const double de = jacobian_step_ *
+            std::max(std::fabs(full[energy_index]),
+                     std::numeric_limits<double>::min());
+          probe[energy_index] += de;
+          calc_f(probe, f_probe);
+          const double jee = (f_probe[energy_index] - f[energy_index]) / de;
+          fast = std::isfinite(jee) && jee <= 0.;
+          for (int i = 0; i < n; ++i) {
+            fast = fast && std::isfinite(f[i]) && std::isfinite(f_probe[i]);
+          }
+        }
+        if (fast) {
+          std::copy(full, full + n, y);
+          result.flag = TerminateFlag::CONVERGED;
+          result.accepted_dt = h;
+          result.error_norm = estimate;
+          result.fast_accepted = true;
+          result.fast_estimate = estimate;
+          const double growth = std::min(2.,
+            0.9 / std::sqrt(std::max(estimate, 1.e-16)));
+          result.suggested_dt = std::min(std::numeric_limits<double>::max(),
+                                         h * std::max(1., growth));
+          return result;
+        }
+      }
+      if (!run_newton(fine, 0.5 * h, f_initial, true, f_middle)) {
         h *= 0.5;
         continue;
       }
@@ -228,6 +352,22 @@ public:
       if (!run_newton(fine, 0.5 * h, f_middle, false, f)) {
         h *= 0.5;
         continue;
+      }
+      // Each half step vouches for itself. Far below tolerance the full step
+      // would only confirm that, so its solve is skipped; otherwise it is
+      // done now and nothing above was wasted.
+      bool skip_full = false;
+      if (halves_first) {
+        estimate = damped_error(0.5 * h, initial, f_initial, middle, f_middle);
+        // the second estimate is moot once the first exceeds the threshold
+        if (estimate <= fast_accept_ || fast_audit_) {
+          estimate += damped_error(0.5 * h, middle, f_middle, fine, f);
+        }
+        skip_full = estimate <= fast_accept_ && !fast_audit_;
+        if (!skip_full && !run_newton(full, h, f_initial, true, nullptr)) {
+          h *= 0.5;
+          continue;
+        }
       }
 
       // Check the entire candidate path, not only the initial derivative.
@@ -272,7 +412,8 @@ public:
         const double error_scale = absolute_tolerance[i]
           + relative_tolerance_ * std::max(std::fabs(initial[i]),
                                           std::fabs(fine[i]));
-        const double error_delta = std::fabs(fine[i] - full[i]);
+        const double error_delta = skip_full ? 0.
+                                             : std::fabs(fine[i] - full[i]);
         const double err_i = (error_scale > 0.) ? error_delta / error_scale
                               : (error_delta == 0. ? 0. : infinity);
         const double change_scale = max_fractional_change_
@@ -285,9 +426,38 @@ public:
         error = std::max(error, err_i);
         change = std::max(change, change_i);
       }
+      if (skip_full) { error = estimate; }
       result.error_norm = error;
+      result.fast_estimate = estimate;
+      result.fast_accepted = skip_full;
       if (error <= 1. && change <= 1.) {
-        std::copy(fine, fine + n, y);
+        bool extrapolated = extrapolate_ && !skip_full;
+        // A stiff component jumping to equilibrium is damped better by the
+        // half steps (~4/z^2) than by extrapolation (~1/z). Such a change is
+        // front-loaded; keep the half steps then, extrapolate smooth changes.
+        for (int i = 0; i < n && extrapolated; ++i) {
+          const double error_scale = absolute_tolerance[i]
+            + relative_tolerance_ * std::max(std::fabs(initial[i]),
+                                            std::fabs(fine[i]));
+          const bool visible =
+            std::fabs(fine[i] - full[i]) > 0.01 * error_scale;
+          const bool front_loaded = std::fabs(fine[i] - middle[i]) <
+            0.2 * std::fabs(middle[i] - initial[i]);
+          extrapolated = !(visible && front_loaded);
+        }
+        if (extrapolated) {
+          for (int i = 0; i < n && extrapolated; ++i) {
+            probe[i] = 2. * fine[i] - full[i];
+            // as in the Newton solve: below the absolute tolerance a negative
+            // value is roundoff and counts as zero
+            if (probe[i] < 0. && probe[i] >= -newton_atol[i]) { probe[i] = 0.; }
+            extrapolated = std::isfinite(probe[i]) && probe[i] >= 0. &&
+              !(i == energy_index && probe[i] == 0.);
+          }
+        }
+        result.extrapolated = extrapolated;
+        std::copy(extrapolated ? probe : fine, (extrapolated ? probe : fine) + n,
+                  y);
         result.flag = TerminateFlag::CONVERGED;
         result.accepted_dt = h;
         const double growth = std::min(2.,

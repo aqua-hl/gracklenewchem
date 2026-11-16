@@ -642,6 +642,23 @@ inline void derivatives(
   );
 }
 
+/// Species time derivatives only, at the rate coefficients left in `pack` by
+/// the last call to @ref derivatives. Reads the species densities currently
+/// stored in the pack. No temperature, cooling or rate lookup is redone.
+inline void species_derivatives_frozen_rates(SpeciesCollection rhosp_dot,
+                                             ContextPack& pack) {
+  View<double**> view(rhosp_dot.data[0], MAX_EVOLVED_SPECIES_FIELDS, 1);
+  for (int sp_idx = 0; sp_idx < MAX_EVOLVED_SPECIES_FIELDS; sp_idx++) {
+    view(sp_idx, 0) = 0.0;
+  }
+  if (pack.fwd_args.my_chemistry->primordial_chemistry == 0) return;
+  ::grackle::impl::chemistry::species_density_derivatives_0d(
+    view, pack.fwd_args.anydust, pack.other_scratch_buf.rhoH,
+    &pack.local_itmask_metal, pack.fwd_args.my_chemistry, &pack.fields,
+    pack.main_scratch_buf.rxn_rate_buf
+  );
+}
+
 
 } // namespace time_deriv_0d
 } // namespace GRIMPL_NAMESPACE_DECL

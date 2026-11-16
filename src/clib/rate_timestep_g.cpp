@@ -23,6 +23,7 @@
 #include "utils-cpp.hpp"
 
 #include "rate_timestep_g.hpp"
+#include "support/scratch.hpp"
 
 namespace grackle::impl {
 
@@ -98,8 +99,8 @@ void rate_timestep_g(double* dedot, double* HIdot, gr_mask_type anydust,
 
   int i;
   double atten;
-  std::vector<double> h2heatfac(my_fields->grid_dimension[0]);
-  std::vector<double> H2delta(my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, h2heatfac, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, H2delta, my_fields->grid_dimension[0]);
 
   if (my_chemistry->primordial_chemistry == 1) {
     for (i = idx_range.i_start; i <= idx_range.i_end; i++) {

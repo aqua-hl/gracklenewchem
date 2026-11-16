@@ -28,6 +28,7 @@
 #include "tabulated/cool1d_cloudy.hpp"
 #include "tabulated/cool1d_cloudy_old_tables.hpp"
 #include "utils-cpp.hpp"
+#include "support/scratch.hpp"
 
 namespace GRIMPL_NAMESPACE_DECL {
 
@@ -141,47 +142,47 @@ void cool1d_multi_g(double* edot, double* alpha_continuum, const double* tgas,
   //   of these buffers as possible (without crippling cache performance on
   //   CPUs)
 
-  std::vector<double> gaHI(my_fields->grid_dimension[0]);
-  std::vector<double> gaH2(my_fields->grid_dimension[0]);
-  std::vector<double> gaHe(my_fields->grid_dimension[0]);
-  std::vector<double> gaHp(my_fields->grid_dimension[0]);
-  std::vector<double> gael(my_fields->grid_dimension[0]);
-  std::vector<double> h2lte(my_fields->grid_dimension[0]);
-  std::vector<double> galdl(my_fields->grid_dimension[0]);
-  std::vector<double> cieY06(my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, gaHI, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, gaH2, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, gaHe, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, gaHp, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, gael, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, h2lte, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, galdl, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, cieY06, my_fields->grid_dimension[0]);
 
-  std::vector<double> logT(my_fields->grid_dimension[0]);
-  std::vector<double> logTcmb(my_fields->grid_dimension[0]);
-  std::vector<double> logrho(my_fields->grid_dimension[0]);
-  std::vector<double> logH(my_fields->grid_dimension[0]);
-  std::vector<double> logH2I(my_fields->grid_dimension[0]);
-  std::vector<double> logHDI(my_fields->grid_dimension[0]);
-  std::vector<double> logH2(my_fields->grid_dimension[0]);
-  std::vector<double> logCI(my_fields->grid_dimension[0]);
-  std::vector<double> logCII(my_fields->grid_dimension[0]);
-  std::vector<double> logOI(my_fields->grid_dimension[0]);
-  std::vector<double> logCO(my_fields->grid_dimension[0]);
-  std::vector<double> logOH(my_fields->grid_dimension[0]);
-  std::vector<double> logH2O(my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, logT, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, logTcmb, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, logrho, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, logH, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, logH2I, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, logHDI, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, logH2, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, logCI, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, logCII, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, logOI, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, logCO, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, logOH, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, logH2O, my_fields->grid_dimension[0]);
   double lognhat;
-  std::vector<double> logdvdr(my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, logdvdr, my_fields->grid_dimension[0]);
   double log_Linv, log_Ginv, L, G;
-  std::vector<double> LH2(my_fields->grid_dimension[0]);
-  std::vector<double> LCIE(my_fields->grid_dimension[0]);
-  std::vector<double> LHD(my_fields->grid_dimension[0]);
-  std::vector<double> LCI(my_fields->grid_dimension[0]);
-  std::vector<double> LCII(my_fields->grid_dimension[0]);
-  std::vector<double> LOI(my_fields->grid_dimension[0]);
-  std::vector<double> LCO(my_fields->grid_dimension[0]);
-  std::vector<double> LOH(my_fields->grid_dimension[0]);
-  std::vector<double> LH2O(my_fields->grid_dimension[0]);
-  std::vector<double> lshield_con(my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, LH2, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, LCIE, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, LHD, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, LCI, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, LCII, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, LOI, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, LCO, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, LOH, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, LH2O, my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, lshield_con, my_fields->grid_dimension[0]);
 
   const gr_opaque_storage& opaque_storage = *my_rates->opaque_storage;
 
   // Iteration mask
 
-  std::vector<gr_mask_type> itmask_tab(my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(gr_mask_type, itmask_tab, my_fields->grid_dimension[0]);
 
   // \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\/////////////////////////////////
   // =======================================================================
@@ -1198,7 +1199,7 @@ void cool1d_multi_g(double* edot, double* alpha_continuum, const double* tgas,
   }
 
   // todo: stop allocating a buffer for tau_con
-  std::vector<double> tau_con(my_fields->grid_dimension[0]);
+  GRIMPL_SCRATCH_VECTOR(double, tau_con, my_fields->grid_dimension[0]);
   for (i = idx_range.i_start; i <= idx_range.i_end; i++) {
     if (itmask[i] != MASK_FALSE) {
       tau_con[i] = alpha_continuum[i] * lshield_con[i];

@@ -22,6 +22,7 @@
 
 #include "../grackle_macros.h"
 #include "gaussj.hpp"
+#include "lu.hpp"
 #include "../support/config.hpp"
 #include "../support/View.hpp"
 
@@ -374,7 +375,8 @@ public:  // public API
                                 const View<double**>* shared_jacobian,
                                 const double* f_at_start,
                                 bool jacobian_at_start,
-                                double* f_out = nullptr) const {
+                                double* f_out = nullptr,
+                                SharedLU* shared_lu = nullptr) const {
     double* ycur_minus_ystart = scratch_ptr;
     double* vec = ycur_minus_ystart + n;
     double* f = vec + n;
@@ -404,6 +406,31 @@ public:  // public API
       y_start[i] = y[i];
       ycur_minus_ystart[i] = 0.0;
     }
+    // (I - h J) is factorised once per Jacobian, with the scaling fixed then.
+    // While J is the caller's shared Jacobian the factors live in shared_lu,
+    // so a later solve with the same h skips the factorisation.
+    GRIMPL_REQUIRE(n <= SharedLU::max_n, "too many variables for the LU");
+    int piv_local[SharedLU::max_n];
+    double scale_local[SharedLU::max_n];
+    double* lu = mtrx.data();
+    int* piv = piv_local;
+    double* s_fac = scale_local;
+    bool lu_valid = false;
+    bool lu_is_shared = false;
+    if (shared_lu != nullptr && shared_jacobian != nullptr) {
+      lu = shared_lu->lu;
+      piv = shared_lu->piv;
+      s_fac = shared_lu->scale;
+      lu_is_shared = true;
+      lu_valid = shared_lu->valid && shared_lu->n == n && shared_lu->h == h;
+    }
+    const auto use_local_lu = [&]() {
+      lu = mtrx.data();
+      piv = piv_local;
+      s_fac = scale_local;
+      lu_is_shared = false;
+      lu_valid = false;
+    };
     // size of the previous correction made with the same Jacobian (or -1)
     double previous = -1.0;
     // scaled residual at the previous failed check with the same Jacobian
@@ -415,27 +442,43 @@ public:  // public API
         if (!std::isfinite(f[i])) {
           return IntegrateResult{TerminateFlag::OTHER_ERR, k};
         }
-        s[i] = std::fmax(std::fabs(y[i]), absolute_tolerance[i] / max_rtol_);
-        if (s[i] == 0.) { s[i] = 1.; }
       }
-      // gaussj overwrites the matrix, so (I - h J) is rebuilt each iteration;
-      // that costs O(n^2) and no RHS evaluations.
-      for (int i = 0; i < n; i++) {
-        vec[i] = (f[i] * h - ycur_minus_ystart[i]) / s[i];
-        for (int j = 0; j < n; j++) {
-          const double a = ((i == j) ? 1.0 : 0.0) - h * (*J)(i, j);
-          mtrx(i, j) = a * s[j] / s[i];
-          if (!std::isfinite(mtrx(i, j))) {
-            return IntegrateResult{TerminateFlag::OTHER_ERR, k};
+      if (!lu_valid) {
+        if (lu_is_shared) { shared_lu->valid = false; }
+        double inv_s[SharedLU::max_n];
+        for (int i = 0; i < n; i++) {
+          s_fac[i] = std::fmax(std::fabs(y[i]),
+                               absolute_tolerance[i] / max_rtol_);
+          if (s_fac[i] == 0.) { s_fac[i] = 1.; }
+          inv_s[i] = 1.0 / s_fac[i];
+        }
+        bool finite = true;
+        for (int i = 0; i < n; i++) {
+          double* row = lu + i * n;
+          for (int j = 0; j < n; j++) {
+            const double a = ((i == j) ? 1.0 : 0.0) - h * (*J)(i, j);
+            row[j] = a * s_fac[j] * inv_s[i];
+            finite = finite &&
+              (std::fabs(row[j]) <= std::numeric_limits<double>::max());
           }
         }
+        if (!finite || lu_factor(n, lu, piv) == 1) {
+          return IntegrateResult{TerminateFlag::OTHER_ERR, k};
+        }
+        lu_valid = true;
+        if (lu_is_shared) {
+          shared_lu->valid = true;
+          shared_lu->n = n;
+          shared_lu->h = h;
+        }
       }
-      if (gaussj(n, mtrx.data(), vec) == 1) {
-        return IntegrateResult{TerminateFlag::OTHER_ERR, k};
+      for (int i = 0; i < n; i++) {
+        vec[i] = (f[i] * h - ycur_minus_ystart[i]) / s_fac[i];
       }
+      lu_solve(n, lu, piv, vec);
       double max_rel = 0.0;
       for (int i = 0; i < n; i++) {
-        vec[i] *= s[i];
+        vec[i] *= s_fac[i];
         ycur_minus_ystart[i] += vec[i];
         y[i] += vec[i];
         if (!std::isfinite(y[i]) || !std::isfinite(vec[i]) ||
@@ -491,6 +534,7 @@ public:  // public API
           return IntegrateResult{TerminateFlag::OTHER_ERR, k + 1};
         }
         J = &jac_local;
+        use_local_lu();
         jacobian_current = true;
         f_ready = true;
         previous = -1.0;
@@ -643,6 +687,7 @@ public:  // public API
       }
       if (residual_small) { return converged(); }
       J = &jac_local;
+      use_local_lu();
       jacobian_current = true;
       f_ready = true;
       previous = -1.0;

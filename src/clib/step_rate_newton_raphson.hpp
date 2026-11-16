@@ -18,11 +18,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <vector>
 
 #include "grackle.h"             // gr_float
 #include "field_adaptor.hpp"
+#include "gas_props.hpp"
 #include "fortran_func_decls.h"  // gr_mask_int
 #include "inject_model/grain_metal_inject_pathways.hpp"
 #include "internal_types.hpp"
@@ -215,7 +219,25 @@ inline bool step_rate_newton_raphson(
   // Error control is independent of the nonlinear-solve tolerance. A
   // successful step uses two backward-Euler half steps and advances only
   // the accepted interval, with bounded retries and thermal stability guards.
-  constexpr double relative_tolerance = 1.e-3;
+  // GRACKLE_NR_JACOBIAN: unset = cheap first Jacobian, "exact" = always the
+  // finite-difference one, "check" = cheap, and report how it differs.
+  static const int jacobian_mode = [] {
+    const char* v = std::getenv("GRACKLE_NR_JACOBIAN");
+    if (v == nullptr) return 1;
+    return (std::strcmp(v, "exact") == 0) ? 0 : (std::strcmp(v, "check") == 0) ? 2 : 1;
+  }();
+  // GRACKLE_NR_RTOL and GRACKLE_NR_MAX_CHANGE override the error tolerance
+  // (1e-3) and the allowed fractional change per substep (0.1);
+  // GRACKLE_NR_EXTRAPOLATE=1 accepts the extrapolated state.
+  static const double relative_tolerance = [] {
+    const char* v = std::getenv("GRACKLE_NR_RTOL");
+    return (v == nullptr) ? 1.e-3 : std::atof(v);
+  }();
+  static const double max_change = [] {
+    const char* v = std::getenv("GRACKLE_NR_MAX_CHANGE");
+    return (v == nullptr) ? 0.1 : std::atof(v);
+  }();
+  static const bool extrapolate = std::getenv("GRACKLE_NR_EXTRAPOLATE") != nullptr;
   // The RHS evaluates gr_float fields, even though Newton iterates in double.
   // Its convergence tolerance must therefore accommodate field roundoff. It
   // only needs to be small next to the 1e-3 error tolerance.
@@ -229,9 +251,64 @@ inline bool step_rate_newton_raphson(
   // The solver verifies a nearby root of sampled residuals within a few ULPs;
   // it never grants a residual allowance proportional to stiffness alone.
   integrate::AdaptiveBackwardEuler ode_solver(
-    i_eng, relative_tolerance, 0.1, 40, nonlinear_tolerance, eps,
+    i_eng, relative_tolerance, max_change, 40, nonlinear_tolerance, eps,
     std::numeric_limits<gr_float>::epsilon(),
     std::numeric_limits<gr_float>::denorm_min());
+
+  // GRACKLE_NR_FAST_ACCEPT=<threshold> enables the substep shortcut (0 = off);
+  // _FAST_MODE=half|full picks it, _FAST_FILTERS the damping passes, and
+  // _FAST_AUDIT compares the estimate with step doubling instead of using it.
+  struct FastAccept {
+    double threshold = 0.;
+    int filters = 2;
+    bool audit = false, report = false, keep_halves = true;
+    unsigned long long steps = 0, fast = 0, extrapolated = 0;
+    // audit: accepted steps by estimate decade (<=1e-3 .. >1), and for each
+    // decade how large the step-doubling error was
+    unsigned long long bins[6] = {0, 0, 0, 0, 0, 0};
+    double worst_doubling[6] = {0., 0., 0., 0., 0., 0.};
+    double worst_ratio[6] = {0., 0., 0., 0., 0., 0.};
+    FastAccept() {
+      const char* v = std::getenv("GRACKLE_NR_FAST_ACCEPT");
+      if (v != nullptr) { threshold = std::atof(v); }
+      v = std::getenv("GRACKLE_NR_FAST_FILTERS");
+      if (v != nullptr) { filters = std::atoi(v); }
+      audit = std::getenv("GRACKLE_NR_FAST_AUDIT") != nullptr;
+      v = std::getenv("GRACKLE_NR_FAST_MODE");
+      keep_halves = (v == nullptr) || std::strcmp(v, "full") != 0;
+      report = audit || std::getenv("GRACKLE_NR_FAST_REPORT") != nullptr;
+    }
+    void record(double estimate, double doubling) {
+      if (!audit || estimate < 0.) { return; }
+      const double edges[5] = {1.e-3, 1.e-2, 1.e-1, 0.3, 1.};
+      int b = 0;
+      while (b < 5 && estimate > edges[b]) { ++b; }
+      bins[b]++;
+      worst_doubling[b] = std::max(worst_doubling[b], doubling);
+      if (estimate > 0.) {
+        worst_ratio[b] = std::max(worst_ratio[b], doubling / estimate);
+      }
+    }
+    ~FastAccept() {
+      if (!report || steps == 0) { return; }
+      std::fprintf(stderr, "NR_FAST_ACCEPT mode=%s threshold=%g filters=%d "
+                   "steps=%llu fast=%llu extrapolated=%llu\n",
+                   keep_halves ? "half" : "full", threshold, filters, steps,
+                   fast, extrapolated);
+      if (!audit) { return; }
+      const char* names[6] = {"<=1e-3", "<=1e-2", "<=1e-1", "<=0.3", "<=1",
+                              ">1"};
+      for (int b = 0; b < 6; ++b) {
+        std::fprintf(stderr, "NR_FAST_AUDIT estimate%s steps=%llu "
+                     "worst_doubling_error=%.3e worst_doubling/estimate=%.3e\n",
+                     names[b], bins[b], worst_doubling[b], worst_ratio[b]);
+      }
+    }
+  };
+  static thread_local FastAccept fast_accept;
+  ode_solver.set_fast_accept(fast_accept.threshold, fast_accept.filters,
+                             fast_accept.audit, fast_accept.keep_halves);
+  ode_solver.set_extrapolate(extrapolate);
 
   std::vector<double> ode_scratch_buf(ode_solver.num_scratch_buf_elements());
 
@@ -554,7 +631,95 @@ inline bool step_rate_newton_raphson(
       // Important: index `i` in these buffers correspond to the `i`th variable
       //            being evolved in the current timestep. The corresponding
       //            entry in `dsp` is at the index `idsp[isp]`.
-      const auto calc_f_and_jacobian = [&](
+      // Same perturbation for the exact and the cheap Jacobian.
+      const auto perturbation = [&](double value, bool energy_column,
+                                    double* perturbed_out) -> double {
+        const double scale_floor = energy_column
+          ? std::max(std::fabs(initial_energy)*1.e-12, double{tiny8})
+          : std::max(double{d(i,j,k)}*1.e-10, double{tiny8});
+        const double base = static_cast<double>(static_cast<gr_float>(value));
+        double perturbed = base + eps*std::max(std::fabs(base), scale_floor);
+        perturbed = static_cast<double>(static_cast<gr_float>(perturbed));
+        if (perturbed == base) {
+          perturbed = std::nextafter(
+            static_cast<gr_float>(base),
+            std::numeric_limits<gr_float>::infinity());
+        }
+        *perturbed_out = perturbed;
+        return perturbed - base;
+      };
+
+      // Cheap Jacobian: energy column from two full evaluations; species
+      // columns from the chemistry at the base state's rate coefficients plus
+      // the temperature change. Approximate energy row; Newton checks residuals.
+      const auto cheap_jacobian = [&](
+          const double* reduced_dsp, double* reduced_dspdot,
+          View<double**>& jacobian) -> void {
+        for (int isp = 0; isp < nsp; isp++) {
+          full_dsp_buf[idsp[isp]] = reduced_dsp[isp];
+        }
+        const int ie = (imp_eng[i] == 1) ? nsp-1 : -1;
+        double de = 0., t_perturbed = 0.;
+        if (ie >= 0) {
+          double perturbed;
+          de = perturbation(reduced_dsp[ie], true, &perturbed);
+          full_dsp_buf[i_eng-1] = perturbed;
+          wrapped_calc_derivatives(dt_FIXME, full_dsp_buf.data(),
+                                   full_dspdot_buf1.data(),
+                                   pack, rhosp_grflt, rhosp_dot);
+          t_perturbed = pack.other_scratch_buf.tgas[0];
+          full_dsp_buf[i_eng-1] = reduced_dsp[ie];
+        }
+        // base state last: the pack keeps its temperature and coefficients
+        wrapped_calc_derivatives(dt_FIXME, full_dsp_buf.data(),
+                                 full_dspdot_buf.data(), pack,
+                                 rhosp_grflt, rhosp_dot);
+        for (int isp = 0; isp < nsp; isp++) {
+          reduced_dspdot[isp] = full_dspdot_buf[idsp[isp]];
+        }
+        const double t_base = pack.other_scratch_buf.tgas[0];
+        const double rhoH_base = pack.other_scratch_buf.rhoH[0];
+        double dT_de = 0.;
+        if (ie >= 0) {
+          for (int isp = 0; isp < nsp; isp++) {
+            jacobian(isp, ie) = (full_dspdot_buf1[idsp[isp]] -
+                                 full_dspdot_buf[idsp[isp]]) / de;
+          }
+          dT_de = (t_perturbed - t_base) / de;
+        }
+        for (int jsp = 0; jsp < nsp; jsp++) {
+          if (jsp == ie) { continue; }
+          const int sp = idsp[jsp];
+          double perturbed;
+          const double dspj = perturbation(reduced_dsp[jsp], false, &perturbed);
+          const gr_float saved = pack.sp_density_buf[sp];
+          pack.sp_density_buf[sp] = static_cast<gr_float>(perturbed);
+          // only e, H, He, H- and H2 species enter the temperature
+          double thermal = 0.;
+          if (ie >= 0 && dT_de != 0. && sp <= SpLUT::H2II) {
+            double t1[1], mmw1[1], rhoH1[1];
+            basic_gas_props(t1, mmw1, rhoH1, pack.other_scratch_buf.itmask,
+                            my_chemistry, &my_rates->cloudy_primordial,
+                            &pack.fields, internalu, pack.idx_range_1_element);
+            thermal = ((t1[0] - t_base) / dspj) / dT_de;
+            pack.other_scratch_buf.rhoH[0] = rhoH1[0];
+          }
+          t_deriv::species_derivatives_frozen_rates(rhosp_dot, pack);
+          pack.sp_density_buf[sp] = saved;
+          pack.other_scratch_buf.rhoH[0] = rhoH_base;
+          for (int isp = 0; isp < nsp; isp++) {
+            if (isp == ie) {
+              jacobian(isp, jsp) = thermal * jacobian(ie, ie);
+            } else {
+              jacobian(isp, jsp) = (rhosp_dot.data[idsp[isp]][0] -
+                                    full_dspdot_buf[idsp[isp]]) / dspj
+                + ((ie >= 0) ? thermal * jacobian(isp, ie) : 0.);
+            }
+          }
+        }
+      };
+
+      const auto exact_jacobian = [&](
           const double* reduced_dsp, double* reduced_dspdot,
           View<double**>& jacobian) -> void {
 
@@ -615,6 +780,51 @@ inline bool step_rate_newton_raphson(
         }
       };
 
+      // The first Jacobian of a substep is the cheap one. Whatever Newton
+      // asks for after that (a rebuild after slow convergence) is exact.
+      int jacobians_this_substep = 0;
+      const auto calc_f_and_jacobian = [&](
+          const double* reduced_dsp, double* reduced_dspdot,
+          View<double**>& jacobian) -> void {
+        if (jacobian_mode == 0 || jacobians_this_substep++ > 0) {
+          exact_jacobian(reduced_dsp, reduced_dspdot, jacobian);
+          return;
+        }
+        cheap_jacobian(reduced_dsp, reduced_dspdot, jacobian);
+        if (jacobian_mode == 2) {
+          // self-check: largest row-scaled difference from the exact Jacobian
+          static thread_local int reports = 0;
+          std::vector<double> buf(nsp * nsp), f_exact(nsp);
+          View<double**> exact(buf.data(), nsp, nsp);
+          exact_jacobian(reduced_dsp, f_exact.data(), exact);
+          const int ie = (imp_eng[i] == 1) ? nsp-1 : -1;
+          double worst[3] = {0., 0., 0.};  // species rows, energy row, energy column
+          for (int r = 0; r < nsp; r++) {
+            double row_scale = 0.;
+            for (int c = 0; c < nsp; c++) {
+              const double s = std::max(std::fabs(reduced_dsp[c]),
+                                        absolute_tolerance[c]/relative_tolerance);
+              row_scale = std::max(row_scale, std::fabs(exact(r, c))*s);
+            }
+            if (row_scale == 0.) { continue; }
+            for (int c = 0; c < nsp; c++) {
+              const double s = std::max(std::fabs(reduced_dsp[c]),
+                                        absolute_tolerance[c]/relative_tolerance);
+              const double err =
+                std::fabs(jacobian(r, c) - exact(r, c))*s/row_scale;
+              double& slot = worst[(c == ie) ? 2 : (r == ie) ? 1 : 0];
+              slot = std::max(slot, err);
+            }
+          }
+          if (reports++ < 40) {
+            std::fprintf(stderr, "JACOBIAN_CHECK T=%.4g species_rows=%.3e "
+                         "energy_row=%.3e energy_column=%.3e\n",
+                         pack.other_scratch_buf.tgas[0],
+                         worst[0], worst[1], worst[2]);
+          }
+        }
+      };
+
       // f(y) alone: one RHS evaluation (Newton reuses the Jacobian)
       const auto calc_f = [&](const double* reduced_dsp_in,
                               double* reduced_dspdot) -> void {
@@ -650,6 +860,10 @@ inline bool step_rate_newton_raphson(
         return false;
       }
       dtit[i] = result.accepted_dt;
+      fast_accept.steps++;
+      fast_accept.fast += result.fast_accepted;
+      fast_accept.extrapolated += result.extrapolated;
+      fast_accept.record(result.fast_estimate, result.error_norm);
 
       // copy values from reduced_dsp back to dsp
       for (int isp = 0; isp < nsp; isp++) {

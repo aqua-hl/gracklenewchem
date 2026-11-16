@@ -24,6 +24,7 @@
 
 #include <cmath>  // std::pow
 #include <vector>
+#include "../support/scratch.hpp"
 
 namespace GRIMPL_NAMESPACE_DECL {
 
@@ -124,7 +125,7 @@ void calc_tdust_1d(double* tdust, const double* tgas, const double* nh,
   const double Trad4 = std::pow(Trad, 4);
 
   // fill a buffer with the heating rate from the interstellar radiation field
-  std::vector<double> gamma_isrf(buf_len);
+  GRIMPL_SCRATCH_VECTOR(double, gamma_isrf, buf_len);
   for (int i = idx_range.i_start; i < idx_range.i_stop; i++) {
     if (itmask[i] != MASK_FALSE) {
       gamma_isrf[i] = isrf[i] * gamma_isrfa[i];
@@ -160,17 +161,17 @@ void calc_tdust_1d(double* tdust, const double* tgas, const double* nh,
                                                    .perturb_min = 1.e-10,
                                                    .tol = 1.e-5};
 
-  std::vector<double> sol(buf_len);
+  GRIMPL_SCRATCH_VECTOR(double, sol, buf_len);
   // holds dust temperature guess for the current root-finding iteration
-  std::vector<double> tdustnow(buf_len);
+  GRIMPL_SCRATCH_VECTOR(double, tdustnow, buf_len);
   // relative finite difference step size
-  std::vector<double> pert(buf_len);
-  std::vector<double> bi_t_high(buf_len);
+  GRIMPL_SCRATCH_VECTOR(double, pert, buf_len);
+  GRIMPL_SCRATCH_VECTOR(double, bi_t_high, buf_len);
 
   // specifies the status of each index (a solver skips a calculation if an
   // index corresponds to SolveStatus::CONVERGED)
-  std::vector<solve_eqn::SolveStatus> solvemask(
-      buf_len, solve_eqn::SolveStatus::CONVERGED);
+  static thread_local std::vector<solve_eqn::SolveStatus> solvemask;
+  solvemask.assign(buf_len, solve_eqn::SolveStatus::CONVERGED);
 
   // setup solvemask for use with newton-raphson and set initial guess
   bool at_least_one_bisection = false;
